@@ -5,10 +5,13 @@ import os
 import random
 import time
 from collections import defaultdict
+from dataclasses import asdict
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import numpy as np
 import torch
+
+from codecarbon import EmissionsTracker
 
 import lm_eval.api.metrics
 import lm_eval.api.registry
@@ -469,6 +472,9 @@ def evaluate(
     :return
         Dictionary of results
     """
+    # Logging is written to lm_eval outputs
+    carbon_tracker = EmissionsTracker(save_to_file=False) 
+    carbon_tracker.start()
 
     if limit is not None and samples is not None:
         raise ValueError(
@@ -518,6 +524,7 @@ def evaluate(
     # Cache the limit arg.
     limit_arg = limit
     limits = []
+    carbon_tracker.start_task(task_name="build_requests")
     for task_output in eval_tasks:
         task: Task = task_output.task
 
@@ -540,6 +547,7 @@ def evaluate(
             else None,
             tokenizer_name=getattr(lm, "tokenizer_name", "")
             if apply_chat_template
+            
             else "",
         )
         eval_logger.debug(
@@ -568,6 +576,8 @@ def evaluate(
             # todo: may not account for padding in cases like SquadV2 which has multiple req types
             padding_requests[reqtype] += numpad
 
+    preprocess_logs = carbon_tracker.stop_task()
+    carbon_tracker.start_task(task_name="process_requests")
     ### Run LM on inputs, get all outputs ###
     # execute each type of request
     for reqtype, reqs in requests.items():
@@ -590,6 +600,9 @@ def evaluate(
 
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
+
+    generate_logs = carbon_tracker.stop_task()
+    carbon_tracker.start_task(task_name="postprocess_outputs")
 
     RANK = lm.rank
     WORLD_SIZE = lm.world_size
@@ -691,6 +704,7 @@ def evaluate(
                         itertools.chain.from_iterable(metric_list)
                     )
 
+    post_process_logs = carbon_tracker.stop_task()
     if RANK == 0:
         ### Aggregate results over all datapoints ###
         # aggregate results ; run bootstrap CIs
@@ -760,6 +774,9 @@ def evaluate(
                 }
                 for task_output, limit in zip(eval_tasks, limits)
             },
+            "emissions_generate": asdict(generate_logs),
+            "emissions_preprocess": asdict(preprocess_logs),
+            "emissions_postprocess": asdict(post_process_logs),
         }
         if log_samples:
             # default: hash images
