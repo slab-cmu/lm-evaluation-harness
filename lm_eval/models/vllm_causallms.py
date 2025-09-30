@@ -10,6 +10,7 @@ from time import sleep
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
 
 import jinja2
+import torch
 from more_itertools import distribute
 from packaging.version import parse as parse_version
 from tqdm import tqdm
@@ -36,6 +37,7 @@ try:
     from vllm.lora.request import LoRARequest
     from vllm.transformers_utils.tokenizer import get_tokenizer
     from vllm.utils import get_open_port
+    from vllm.v1.sample.logits_processor import LogitsProcessor
 
     if parse_version(version("vllm")) >= parse_version("0.8.3"):
         from vllm.entrypoints.chat_utils import resolve_hf_chat_template
@@ -47,6 +49,53 @@ if TYPE_CHECKING:
 
 eval_logger = logging.getLogger(__name__)
 
+# TODO: Add to vllm 
+class ThinkLogitsProcessor(LogitsProcessor):
+    """A logits processor that limit the number of thinking tokens."""
+    
+    def __init__(self, think_start_token, think_end_token, num_think_tokens: int = 100, num_think_chains: int = -1):
+        """
+        Initialize the think logits processor.
+        
+        Args:
+            tokenizer: The tokenizer used for the model
+            num_think_tokens: Maximum number of tokens allowed in thinking section
+        """
+        self.num_think_tokens = num_think_tokens
+        self.num_think_chains = num_think_chains
+        self.think_start_token = think_start_token
+        self.think_end_token = think_end_token
+        
+    def __call__(
+        self,
+        input_ids: List[int],
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Process the logits to enforce </think> token when needed.
+        
+        Args:
+            input_ids: List of input token IDs.
+            logits: Tensor of logits for the next token.
+            
+        Returns:
+            Processed logits tensor.
+        """
+        # Check if we're in a thinking section
+        if self.think_start_token in input_ids and self.think_end_token not in input_ids:
+            # Find the position of the last <think> token
+            think_start_pos = len(input_ids) - 1 - input_ids[::-1].index(self.think_start_token)
+            
+            # Calculate number of tokens since <think>
+            tokens_since_think = len(input_ids) - think_start_pos - 1
+            
+            # If we've reached the maximum thinking length, force </think>
+            if tokens_since_think >= self.num_think_tokens:
+                # Set all other logits to -inf except for </think>
+                logits = torch.full_like(logits, float('-inf'))
+                logits[self.think_end_token] = 1.0
+                
+        return logits 
 
 def _vllm_mp_worker(
     model_args: dict,
@@ -174,6 +223,7 @@ class VLLM(TemplateLM):
             "seed": int(seed),
             "enable_lora": True if lora_local_path else False,
             "max_lora_rank": int(max_lora_rank),
+            "logits_processor": [ThinkLogitsProcessor]
         }
         self.model_args.update(kwargs)
         self.batch_size = (
@@ -182,7 +232,9 @@ class VLLM(TemplateLM):
             else int(batch_size)
         )
         if self.data_parallel_size <= 1:
-            self.model = LLM(**self.model_args)
+            self.model = LLM(
+                **self.model_args
+            )
         else:
             eval_logger.warning(
                 "You might experience occasional issues with model weight downloading when data_parallel is in use. To ensure stable performance, run with data_parallel_size=1 until the weights are downloaded and cached."
