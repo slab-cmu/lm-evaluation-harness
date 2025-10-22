@@ -223,7 +223,7 @@ class VLLM(TemplateLM):
             "seed": int(seed),
             "enable_lora": True if lora_local_path else False,
             "max_lora_rank": int(max_lora_rank),
-            "logits_processor": [ThinkLogitsProcessor]
+            "logits_processors": [ThinkLogitsProcessor]
         }
         self.model_args.update(kwargs)
         self.batch_size = (
