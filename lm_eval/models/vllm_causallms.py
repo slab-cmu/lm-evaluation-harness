@@ -77,8 +77,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         )
 
         self.think_start_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<think>"))
-        self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(
+        self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("Wait"))
+        self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>")) 
+        self.think_termination_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(
             # self.tokenizer.tokenize("</think>\n\n The answer is:")
+            # TODO: This could be intercepted with prefill rather than decoding, but we'll do drop in replacement for now for performance scaling.
+            #   Output predictions should be the same asssuming determinism. This termination sequence is from the Qwen3 documentation.
             "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n The final answer is: "
         ))
 
@@ -121,7 +125,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         return -1
 
     def _init_state_entry(
-        self, prompt_tok_ids: Optional[list[int]], thinking_token_budget: int
+        self, prompt_tok_ids: Optional[list[int]], thinking_token_budget_max: int, thinking_token_budget_min: int
     ) -> dict[str, Any]:
         """Initializes the tracking state for a given sequence index."""
         if prompt_tok_ids is None:
@@ -145,13 +149,13 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 think_count = 0
         return {
             "in_think": in_think,  # Currently in thinking mode
-            "in_end": in_think and thinking_token_budget == 0,
-            "check_count_down": thinking_token_budget,
+            "in_end": in_think and thinking_token_budget_max == 0,
+            "check_count_down": thinking_token_budget_max,
             "think_count": think_count,  # Number of tokens in thinking section
             "end_count": 0,  # Number of end tokens forced so far
             "prompt_tok_ids": prompt_tok_ids,
             "output_tok_ids": [],
-            "thinking_token_budget": thinking_token_budget,
+            "thinking_token_budget_max": thinking_token_budget_max,
             "prev_output_length": 0,
             # Track previous output length for incremental updates
         }
@@ -224,30 +228,30 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             # Set countdown based on current state
             if state["in_think"]:
                 remaining_budget = max(
-                    0, state["thinking_token_budget"] - state["think_count"]
+                    0, state["thinking_token_budget_max"] - state["think_count"]
                 )
                 state["check_count_down"] = remaining_budget
             else:
-                state["check_count_down"] = state["thinking_token_budget"]
+                state["check_count_down"] = state["thinking_token_budget_max"]
 
             # Check if need to transition to end mode
             if (
                 state["in_think"]
-                and state["think_count"] >= state["thinking_token_budget"]
+                and state["think_count"] >= state["thinking_token_budget_max"]
             ):
                 state["in_think"] = False
                 state["in_end"] = True
                 state["end_count"] = 0
-                state["check_count_down"] = state["thinking_token_budget"]
+                state["check_count_down"] = state["thinking_token_budget_max"]
         else:
             # In end mode
             state["end_count"] += 1
-            if state["end_count"] >= len(self.think_end_token_ids):
+            if state["end_count"] >= len(self.think_termination_token_ids):
                 state.update(
                     {
                         "in_end": False,
                         "end_count": 0,
-                        "check_count_down": state["thinking_token_budget"],
+                        "check_count_down": state["thinking_token_budget_max"],
                     }
                 )
 
@@ -262,11 +266,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             return
         if batch_update:
             for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
-                thinking_token_budget = params.extra_args['thinking_token_budget_max']
+                thinking_token_budget_max = params.extra_args.get('thinking_token_budget_max', None)
+                thinking_token_budget_min = params.extra_args.get('thinking_token_budget_min', None)
 
-                if thinking_token_budget is not None:
+                if thinking_token_budget_max is not None or thinking_token_budget_min is not None:
                     self._state[index] = self._init_state_entry(
-                        prompt_tok_ids, thinking_token_budget
+                        prompt_tok_ids, thinking_token_budget_max, thinking_token_budget_min
                     )
                     self._state[index]["output_tok_ids"] = output_tok_ids
                 else:
@@ -300,7 +305,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             state = self._state.get(i)
             if state and state["in_end"]:
                 self.mask[i] = True
-                self.force_token_ids[i] = self.think_end_token_ids[state['end_count']]
+                self.force_token_ids[i] = self.think_termination_token_ids[state['end_count']]
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
