@@ -3,22 +3,40 @@ import json
 import logging
 import os
 import sys
+import yaml
 from functools import partial
 from pathlib import Path
 from typing import Union
+from lm_eval.utils import simple_parse_args_string
 
-def try_parse_json(value: str) -> Union[str, dict, None]:
+def try_parse_json_or_yaml(value: str) -> Union[str, dict, None]:
     # TODO: Load args from file
     if value is None:
         return None
     try:
+        with open(value, 'r') as value_file:
+            return yaml.safe_load(value_file)
+    except: 
+        logging.warning(f"Unable to load {value} as yaml file. Trying as literal string")
+
+    try:
+        with open(value, 'r') as value_file:
+            return json.load(value_file)
+    except: 
+        logging.warning(f"Unable to load {value} as json file. Trying as literal string")
+
+    try:
         return json.loads(value)
     except json.JSONDecodeError:
         if "{" in value:
-            raise argparse.ArgumentTypeError(
+           logging.warning(
                 f"Invalid JSON: {value}. Hint: Use double quotes for JSON strings."
             )
-        return value
+    try:
+        return simple_parse_args_string(value)
+    except:
+        logging.warning("Unable to parse literal string into dict")
+        
 
 
 def _int_or_none_list_arg_type(
@@ -84,10 +102,15 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Comma-separated list of task names or task groupings to evaluate on.\nTo get full list of tasks, use one of the commands `lm-eval --tasks {{list_groups,list_subtasks,list_tags,list}}` to list out all available names for task groupings; only (sub)tasks; tags; or all of the above",
     )
     parser.add_argument(
+        "--model_args_file",
+        default="configs/model_args.yaml",
+        type=str
+    )
+    parser.add_argument(
         "--model_args",
         "-a",
         default="",
-        type=try_parse_json,
+        type=try_parse_json_or_yaml,
         help="""Comma separated string or JSON formatted arguments for model, e.g. `pretrained=EleutherAI/pythia-160m,dtype=float32` or '{"pretrained":"EleutherAI/pythia-160m","dtype":"float32"}'""",
     )
     parser.add_argument(
@@ -217,8 +240,13 @@ def setup_parser() -> argparse.ArgumentParser:
         help="Additional path to include if there are external tasks to include.",
     )
     parser.add_argument(
+        "--gen_kwargs_file",
+        type=str,
+        default="./configs/gen_kwargs.yaml"
+    )
+    parser.add_argument(
         "--gen_kwargs",
-        type=try_parse_json,
+        type=try_parse_json_or_yaml,
         default=None,
         help=(
             "Either comma delimited string or JSON formatted arguments for model generation on greedy_until tasks,"
@@ -357,6 +385,13 @@ def cli_evaluate(args: Union[argparse.Namespace, None] = None) -> None:
         if isinstance(args.metadata, dict)
         else simple_parse_args_string(args.metadata)
     )
+
+    default_gen_kwargs = try_parse_json_or_yaml(args.gen_kwargs_file)
+    default_model_args = try_parse_json_or_yaml(args.model_args_file)
+
+    args.gen_kwargs = {**default_gen_kwargs, **args.gen_kwargs}
+    args.model_args = {**default_model_args, **metadata, **args.model_args}
+    metadata = args.model_args
 
     task_manager = TaskManager(include_path=args.include_path, metadata=metadata)
 

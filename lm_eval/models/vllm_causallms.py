@@ -340,8 +340,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     self._state[i2] = self._state.pop(i1, {})
 
         for state in self._state.values():
-            if thinking_token_budget_max is not None or thinking_token_budget_min is not None:
-                self._update_think_state(state)
+            self._update_think_state(state)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self.is_enabled or not self._state:
