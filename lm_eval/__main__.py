@@ -7,8 +7,8 @@ from functools import partial
 from pathlib import Path
 from typing import Union
 
-
 def try_parse_json(value: str) -> Union[str, dict, None]:
+    # TODO: Load args from file
     if value is None:
         return None
     try:
