@@ -293,6 +293,11 @@ class Task(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def has_fewshot_docs(self):
+        """Whether the task has a fewshot set"""
+        pass
+
+    @abc.abstractmethod
     def has_validation_docs(self):
         """Whether the task has a validation set"""
         pass
@@ -303,6 +308,13 @@ class Task(abc.ABC):
         pass
 
     def training_docs(self) -> Iterable:
+        """
+        :return: Iterable[obj]
+            A iterable of any object, that doc_to_text can handle
+        """
+        return []
+
+    def fewshot_docs(self) -> Iterable:
         """
         :return: Iterable[obj]
             A iterable of any object, that doc_to_text can handle
@@ -328,6 +340,8 @@ class Task(abc.ABC):
         :return: Iterable[obj]
             A iterable of any object, that doc_to_text can handle
         """
+        if self.has_fewshot_docs():
+            return self.fewshot_docs()
         if self.has_training_docs():
             return self.training_docs()
         elif self.has_validation_docs():
@@ -359,10 +373,14 @@ class Task(abc.ABC):
         return self._instances
 
     def fewshot_examples(self, k, rnd):
-        if self._training_docs is None:
-            self._training_docs = list(self.training_docs())
-
-        return rnd.sample(self._training_docs, k)
+        if self.has_fewshot_docs():
+            if self._fewshot_docs is None:
+                self._fewshot_docs = list(self.fewshot_docs())
+            return rnd.sample(self._fewshot_docs, k)
+        else:
+            if self._training_docs is None:
+                self._training_docs = list(self.training_docs())
+            return rnd.sample(self._training_docs, k)
 
     def doc_to_decontamination_query(self, doc):
         raise NotImplementedError(
@@ -596,7 +614,7 @@ class Task(abc.ABC):
             labeled_examples = ""
         else:
             # for sets with no training docs, draw from other set *but ensure no overlap with current doc*
-            if self.has_training_docs():
+            if self.has_training_docs() or self.has_fewshot_docs():
                 fewshotex = self.fewshot_examples(k=num_fewshot, rnd=rnd)
             else:
                 if self._fewshot_docs is None:
@@ -1012,6 +1030,12 @@ class ConfigurableTask(Task):
         else:
             return False
 
+    def has_fewshot_docs(Self) -> bool:
+        if self.config.fewshot_config.dataset_path is not None:
+            return True
+        else:
+            return False
+
     def has_test_docs(self) -> bool:
         if self.config.test_split is not None:
             return True
@@ -1042,6 +1066,17 @@ class ConfigurableTask(Task):
 
     def fewshot_docs(self):
         if self.config.fewshot_split is not None:
+            if self.config.fewshot_config.get('dataset_path', None) is not None:
+                self.fewshot_dataset = datasets.load_dataset(
+                    path=self.config.fewshot_config.get('dataset_path', ""),
+                    name=self.config.fewshot_config.get('dataset_name', "")
+                )
+                if self.config.fewshot_config.get("process_docs", None) is not None:
+                    return self.config.fewshot_config.process_docs(
+                        self.fewshot_dataset[self.config.fewshot_split]
+                    )
+                return self.fewshot_dataset[self.config.fewshot_split]
+
             if self.config.process_docs is not None:
                 return self.config.process_docs(self.dataset[self.config.fewshot_split])
             return self.dataset[self.config.fewshot_split]
@@ -1141,6 +1176,7 @@ class ConfigurableTask(Task):
             system_prompt = description
         else:
             system_prompt = ""
+        breakpoint()
 
         # add system prompt if specified
         if system_prompt:
