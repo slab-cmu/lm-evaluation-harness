@@ -33,7 +33,7 @@ def extract_code_blocks(text: str) -> str:
     # Pattern to match ```...``` blocks
     pattern = r"```(?:\w+)?\n?(.*?)\n?```"
     # (+ ```) as we add the opening "```python" to the gen_prefix
-    matches = re.findall(pattern, r"```" + text, re.DOTALL)
+    matches = re.findall(pattern, "```python\n" + text, re.DOTALL)
     # if no matches, try to match ```...``` blocks (after removing the language)
     if not matches:
         text_without_lang = re.sub(r"```python", "```", text)
