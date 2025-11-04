@@ -1066,7 +1066,8 @@ class ConfigurableTask(Task):
 
     def fewshot_docs(self):
         if self.config.fewshot_split is not None:
-            if self.config.fewshot_config.get('dataset_path', None) is not None:
+            if (self.config.fewshot_config is not None and
+                self.config.fewshot_config.get('dataset_path', None) is not None):
                 self.fewshot_dataset = datasets.load_dataset(
                     path=self.config.fewshot_config.get('dataset_path', ""),
                     name=self.config.fewshot_config.get('dataset_name', "")
@@ -1176,7 +1177,6 @@ class ConfigurableTask(Task):
             system_prompt = description
         else:
             system_prompt = ""
-        breakpoint()
 
         # add system prompt if specified
         if system_prompt:
