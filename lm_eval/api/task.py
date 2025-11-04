@@ -1030,8 +1030,9 @@ class ConfigurableTask(Task):
         else:
             return False
 
-    def has_fewshot_docs(Self) -> bool:
-        if self.config.fewshot_config.dataset_path is not None:
+    def has_fewshot_docs(self) -> bool:
+        if (self.config.fewshot_config is not None and
+            self.config.fewshot_config.get(dataset_path, None) is not None):
             return True
         else:
             return False
