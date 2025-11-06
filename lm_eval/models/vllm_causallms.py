@@ -992,13 +992,9 @@ class VLLM(TemplateLM):
             for output, context in zip(cont, context):
                 generated_text: str = output.outputs[0].text
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
-                print(f"Generated: {generated_text}")
-                print(f"Generated Length: {len(self.tokenizer.tokenize(generated_text))}")
                 generated_text = postprocess_generated_text(
                     generated_text, until, self.think_end_token
                 )
-                print(f"Filtered: {generated_text}")
-                print(f"Filtered Length: {len(self.tokenizer.tokenize(generated_text))}")
                 res.append(generated_text)
                 self.cache_hook.add_partial(
                     "generate_until", (context, gen_kwargs), generated_text
