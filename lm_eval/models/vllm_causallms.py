@@ -77,7 +77,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         )
 
         self.think_start_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<think>"))
-        self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("Wait"))
+        self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("Let's verify this solution"))
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>")) 
         self.think_termination_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(
             # self.tokenizer.tokenize("</think>\n\n The answer is:")
@@ -151,7 +151,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             "in_think": in_think,  # Currently in thinking mode
             "in_end": in_think and thinking_token_budget_max == 0,
             "in_continuation": False,
-            "check_count_down": thinking_token_budget_max,
+            "check_count_down": 1, # thinking_token_budget_max,
             "think_count": think_count,  # Number of tokens in thinking section
             "end_count": 0,  # Number of end tokens forced so far
             "continuation_count": 0,
@@ -201,7 +201,6 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         recent_end_pos = self._find_last_sequence_index(
             recent_tokens, self.think_end_token_ids
         )
-
         # TODO(Jared): Suppress ANY EoS Token until; including eot besides </think>
         # recent_end_seq_pos = self._find_last_sequence_index(
         #     recent_tokens
@@ -216,45 +215,22 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     new_think_count = current_length - (absolute_start_pos + start_len)
                     state["in_think"] = True
                     state["think_count"] = new_think_count
-                    state["in_continuation"] = False
-                    state["continuation_count"] = 0
                 else:
                     # Case: ...<start>...<end>... - exiting think mode
                     if state["think_count"] >= state["thinking_token_budget_min"]:
                         state["in_think"] = False
                         state["think_count"] = 0
-                        state["in_continuation"] = False
-                        state["continuation_count"] = 0
-                    else:
-                        absolute_start_pos = check_start_idx + recent_start_pos
-                        new_think_count = current_length - (absolute_start_pos + start_len)
 
-                        state["in_think"] = True
-                        state["think_count"] =  new_think_count
-
-                        state["in_continuation"] = True
-                        state["continuation_count"] += 1
             elif recent_start_pos >= 0:
                 # Found think start - entering think mode
                 absolute_start_pos = check_start_idx + recent_start_pos
                 new_think_count = current_length - (absolute_start_pos + start_len)
                 state["in_think"] = True
                 state["think_count"] = new_think_count
-
-                state["in_continuation"] = False
-                state["continuation_count"] = 0
             elif recent_end_pos >= 0 and state["think_count"]:
                 # Found think end - exiting think mode
-                if state["think_count"] >= state["thinking_token_budget_min"]:
-                    state["in_think"] = False
-                    state["think_count"] = 0
-                # Think Count was Insufficient
-                else:
-                    state["in_think"] = True
-                    state["think_count"] = current_length - (absolute_start_pos + start_len) 
-
-                    state["in_continuation"] = True
-                    state["continuation_count"] += 1
+                state["in_think"] = False
+                state["think_count"] = 0
             elif state["in_think"]:
                 # Continue thinking mode, increment count by new tokens
                 state["think_count"] += len(new_tokens)
@@ -263,9 +239,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             if state["in_think"]:
                 remaining_budget = max(
                     0, state["thinking_token_budget_max"] - state["think_count"], 
-                    state["thinking_token_budget_min"] - state["think_count"],  
-                    len(self.think_continuation_token_ids) - state['continuation_count']
-                )
+                    )
                 state["check_count_down"] = remaining_budget
             else:
                 state["check_count_down"] = state["thinking_token_budget_max"]
@@ -280,16 +254,6 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 state["in_end"] = True
                 state["end_count"] = 0
                 state["check_count_down"] = state["thinking_token_budget_max"]
-            
-            if (
-                state["in_continuation"]
-                and state["continuation_count"] < len(self.think_continuation_token_ids) 
-            ):
-                state["in_think"] = True
-                state["in_end"] = False
-                state["end_count"] = 0
-                state["continuation_count"] += 1
-                state["check_count_down"] = len(self.think_continuation_token_ids) - state['continuation_count']
         else:
             # In end mode
             state["end_count"] += 1
@@ -354,37 +318,72 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             if state and state["in_end"]:
                 self.mask[i] = True
                 self.force_token_ids[i] = self.think_termination_token_ids[state['end_count']]
-            if state and state["in_continuation"]:
+
+            # Either begin continuation sequence if </think> is present; or if already in continuation
+            if state and (
+                (state["in_continuation"] == True and state['continuation_count'] < len(self.think_continuation_token_ids)
+            ) or (
+                torch.argmax(logits) == self.think_end_token_ids[0]
+                and len(state['output_tok_ids']) < state['thinking_token_budget_min']
+            )):
+                state["in_continuation"] = True
                 self.mask[i] = True
-                if state["continuation_mode"] == "suppress_end_think":
-                    self.force_token_ids[i] = self.think_end_token_ids[state['continuation_count']]
-                elif state["continuation_mode"] == "wait":
+                if (
+                    state["continuation_mode"] == "wait" 
+                    and state['continuation_count'] < len(self.think_continuation_token_ids)
+                ):
                     self.force_token_ids[i] = self.think_continuation_token_ids[state['continuation_count']]
+
+            # Suppress </think> if under the required budget
+            if len(state['output_tok_ids']) < state['thinking_token_budget_min']:
+                logits[:, self.think_end_token_ids[0]] = 0
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
             state.get("in_end", False) for state in self._state.values()
         )
+        has_active_continuation = any(
+            state.get("in_continuation", False) for state in self._state.values()
+        )
 
-        if has_active_thinking and state["in_end"]:
+        if has_active_thinking: #  and state["in_end"]:
             current_mask = self.mask[:batch_size]
             active_indices = current_mask.nonzero(as_tuple=False).view(-1)
             if len(active_indices) > 0:
                 force_tokens = self.force_token_ids[active_indices]
                 # Apply a large value for the end thinking token id index
                 logits[active_indices, force_tokens] = 1e9
-        if state["in_continuation"]:
+
+
+        if has_active_continuation and state["continuation_mode"] == "wait":
             current_mask = self.mask[:batch_size]
             active_indices = current_mask.nonzero(as_tuple=False).view(-1)
-            if len(active_indices) > 0:
-                if state["continuation_mode"] == "suppress_end_think":
-                    # Option 1: Suppress </think> token and resample with adjusted logits
-                    force_tokens = self.force_token_ids[active_indices]
-                    logits[active_indices, force_tokens] = 0
-                elif state["continuation_mode"] == "wait":
-                    # Option 2: Force large logit value for "Wait" continuation token
-                    force_tokens = self.force_token_ids[active_indices]
-                    logits[active_indices, force_tokens] = 1e9
+            # Also, force large logit value for continuation sequence token
+            force_tokens = self.force_token_ids[active_indices]
+            logits[active_indices, force_tokens] = 1e9
+
+        # Increment the tracker on the continuation sequence or reset if done
+        for i in range(batch_size):
+            state = self._state.get(i)
+            if state["continuation_mode"] == "suppress_end_think":
+                state['in_continuation'] = False
+                state['continuation_count'] = 0
+            elif (
+                state["continuation_mode"] == "wait" and state['in_continuation']
+                and state['continuation_count'] < len(self.think_continuation_token_ids)
+            ): 
+                state['continuation_count'] += 1
+            elif(
+                state["continuation_mode"] == "wait"
+                and state['continuation_count'] >= len(self.think_continuation_token_ids)
+            ):
+                state.update(
+                    {
+                        "in_continuation": False,
+                        "continuation_count": 0,
+                        "check_count_down": state["thinking_token_budget_max"] - state['think_count'],
+                    }
+                )
 
         return logits
 
