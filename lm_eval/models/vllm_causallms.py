@@ -125,9 +125,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         return -1
 
     def _init_state_entry(
-        self, prompt_tok_ids: Optional[list[int]], thinking_token_budget_max: int, thinking_token_budget_min: int, continuation_mode: str
+        self, prompt_tok_ids: Optional[list[int]], thinking_token_budget_max: int, thinking_token_budget_min: int, answer_prefix_ids:[list[int]], continuation_mode: str
     ) -> dict[str, Any]:
         """Initializes the tracking state for a given sequence index."""
+        if answer_prefix_ids is not None:
+            self.think_termination_token_ids.extend(answer_prefix_ids)
+
         if prompt_tok_ids is None:
             last_start = -1
             last_end = -1
@@ -279,11 +282,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
                 thinking_token_budget_max = params.extra_args.get('thinking_token_budget_max', None)
                 thinking_token_budget_min = params.extra_args.get('thinking_token_budget_min', None)
+                answer_prefix_ids = params.extra_args.get('answer_prefix_ids', None)
                 continuation_mode = params.extra_args.get("continuation_mode", "wait")
 
                 if thinking_token_budget_max is not None or thinking_token_budget_min is not None:
                     self._state[index] = self._init_state_entry(
-                        prompt_tok_ids, thinking_token_budget_max, thinking_token_budget_min, continuation_mode
+                        prompt_tok_ids, thinking_token_budget_max, thinking_token_budget_min, answer_prefix_ids, continuation_mode
                     )
                     self._state[index]["output_tok_ids"] = output_tok_ids
                 else:
@@ -346,7 +350,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             state.get("in_continuation", False) for state in self._state.values()
         )
 
-        if has_active_thinking: #  and state["in_end"]:
+        if has_active_thinking and state["in_end"]:
             current_mask = self.mask[:batch_size]
             active_indices = current_mask.nonzero(as_tuple=False).view(-1)
             if len(active_indices) > 0:
@@ -477,6 +481,7 @@ class VLLM(TemplateLM):
         # End marker for thinking tags - splits to get response after this token (if provided).
         think_start_token: Optional[str] = None,
         think_end_token: Optional[str] = None,
+        answer_prefix: Optional[str] = None,
         max_think_tokens: Optional[int] = None,
         min_think_tokens: Optional[int] = None,
         max_lora_rank: int = 16,
@@ -495,6 +500,7 @@ class VLLM(TemplateLM):
         )
         kwargs.pop("device", None)
         self.think_end_token = think_end_token
+        self.answer_prefix = answer_prefix
         self.V1 = os.environ.get("VLLM_USE_V1", "1") != "0"
         self._max_length = max_model_len if max_model_len is not None else max_length
         self.tensor_parallel_size = int(tensor_parallel_size)
@@ -722,6 +728,12 @@ class VLLM(TemplateLM):
             )
         if not isinstance(sampling_params, List):
             sampling_params = [sampling_params] * len(requests)
+
+        answer_prefix_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(self.answer_prefix))
+        if self.answer_prefix is not None:
+            for sample_params in sampling_params:
+                sample_params.extra_args['answer_prefix_ids'] = answer_prefix_ids
+
         if self.data_parallel_size > 1 and not self.V1:
             # vLLM hangs if resources are set in ray.remote
             # also seems to only work with decorator and not with ray.remote() fn
