@@ -732,6 +732,8 @@ class VLLM(TemplateLM):
         answer_prefix_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(self.answer_prefix))
         if self.answer_prefix is not None:
             for sample_params in sampling_params:
+                if sample_params.extra_args is None:
+                    sample_params.extra_args = {}
                 sample_params.extra_args['answer_prefix_ids'] = answer_prefix_ids
 
         if self.data_parallel_size > 1 and not self.V1:
