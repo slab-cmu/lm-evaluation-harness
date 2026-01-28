@@ -541,8 +541,8 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
                     self._state[i1], self._state[i2] = (
                         self._state[i2], self._state[i1]
                     )
-                elif direction == MoveDirectionality.MOVE:
-                    self._state[i2] = self._state.pop(i1)
+                else:
+                    self._state[i2] = self._state.pop(i1, {})
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         """
