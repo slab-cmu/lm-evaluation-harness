@@ -522,6 +522,16 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
         # Counter for apply() calls
         self._apply_call_count = 0
 
+        # Write diagnostic on initialization
+        try:
+            with open('/tmp/banking77_processor_init.txt', 'w') as f:
+                f.write(f"Initialized successfully\n")
+                f.write(f"ENABLE_BANKING77_CONSTRAINTS={env_enabled}\n")
+                f.write(f"num_labels={len(self.banking77_labels)}\n")
+                f.write(f"max_seq_length={self.max_seq_length}\n")
+        except Exception as e:
+            pass
+
     def is_argmax_invariant(self) -> bool:
         """Returns False because this processor modifies greedy sampling behavior."""
         return False
@@ -835,7 +845,15 @@ class VLLM(TemplateLM):
             f"VLLM.__init__: Total logits processors: {len(processors)}"
         )
 
-        self.model_args['logits_processors'] = processors
+        # For vLLM v1, logits_processors go in engine_args, not model_args directly
+        if self.V1 and processors:
+            # Store processors for later use - they'll be passed via engine config
+            self.model_args['logits_processors'] = processors
+            eval_logger.info(
+                f"VLLM.__init__: Stored {len(processors)} processors for vLLM v1"
+            )
+        elif processors:
+            self.model_args['logits_processors'] = processors
 
         self.model_args.update(kwargs)
         self.batch_size = (
