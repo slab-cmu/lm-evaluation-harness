@@ -405,6 +405,14 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
         device="cuda:0",
         is_pin_memory=True,
     ):
+        # Check if enabled via environment variable
+        env_enabled = os.environ.get(
+            'ENABLE_BANKING77_CONSTRAINTS', 'false'
+        ).lower()
+        eval_logger.info(
+            f"BankingIntentLogitsProcessor: ENABLE_BANKING77_CONSTRAINTS={env_enabled}"
+        )
+
         # Get tokenizer using same pattern as ThinkingTokenBudgetLogitsProcessor
         tokenizer_name = (
             vllm_config.model_config.tokenizer
@@ -477,6 +485,16 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
         # Find max sequence length for padding
         self.max_seq_length = max(len(seq) for seq in self.label_token_sequences)
 
+        eval_logger.info(
+            f"BankingIntentLogitsProcessor: Tokenized {len(self.banking77_labels)} labels"
+        )
+        eval_logger.info(
+            f"BankingIntentLogitsProcessor: Intent prefix tokens: {self.intent_prefix_ids}"
+        )
+        eval_logger.info(
+            f"BankingIntentLogitsProcessor: Max sequence length: {self.max_seq_length}"
+        )
+
         # Convert to numpy array and pad with -1 (invalid token marker)
         import numpy as np
         self.label_token_array = np.full(
@@ -500,6 +518,9 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
         # Preallocated tensors for batch operations
         self.device = device
         self.pin_memory = is_pin_memory
+
+        # Counter for apply() calls
+        self._apply_call_count = 0
 
     def is_argmax_invariant(self) -> bool:
         """Returns False because this processor modifies greedy sampling behavior."""
@@ -553,13 +574,28 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
         env_enabled = os.environ.get(
             'ENABLE_BANKING77_CONSTRAINTS', 'false'
         ).lower()
+
+        self._apply_call_count += 1
         if env_enabled != 'true':
+            if self._apply_call_count == 1:
+                eval_logger.warning(
+                    "BankingIntentLogitsProcessor.apply(): Constraints DISABLED - returning unmodified logits"
+                )
             return logits
 
         if not self._state:
             return logits
 
         batch_size = logits.size(0)
+
+        # Log on first active constraint application
+        if self._apply_call_count == 1 and self._state:
+            eval_logger.info(
+                f"BankingIntentLogitsProcessor.apply(): Applying constraints to batch_size={batch_size}"
+            )
+            eval_logger.info(
+                f"BankingIntentLogitsProcessor.apply(): Active states: {len(self._state)}"
+            )
 
         for i in range(batch_size):
             state = self._state.get(i)
@@ -583,6 +619,13 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
 
             # Get unique valid tokens
             unique_tokens = torch.unique(valid_next_tokens)
+
+            # Log first constraint application details
+            if self._apply_call_count == 1 and i == 0:
+                eval_logger.info(
+                    f"BankingIntentLogitsProcessor.apply(): position={position}, "
+                    f"unique_tokens_count={len(unique_tokens)}"
+                )
 
             if len(unique_tokens) == 0:
                 # No valid tokens - shouldn't happen, but handle gracefully
@@ -768,9 +811,18 @@ class VLLM(TemplateLM):
         processors = []
         if self.enable_thinking:
             processors.append(ThinkingTokenBudgetLogitsProcessor)
+            eval_logger.info(
+                "VLLM.__init__: Registered ThinkingTokenBudgetLogitsProcessor"
+            )
 
         # Always add Banking77 processor - it will check env var internally
         processors.append(BankingIntentLogitsProcessor)
+        eval_logger.info(
+            "VLLM.__init__: Registered BankingIntentLogitsProcessor"
+        )
+        eval_logger.info(
+            f"VLLM.__init__: Total logits processors: {len(processors)}"
+        )
 
         self.model_args['logits_processors'] = processors
 
