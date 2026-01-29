@@ -401,8 +401,6 @@ class NoOpLogitsProcessor(LogitsProcessor):
     This processor does nothing but return logits unchanged. Its presence ensures that
     vLLM v1 properly initializes the guided decoding backend (XGrammar) even when no
     other logits processors are active.
-
-    See: https://github.com/vllm-project/vllm/issues/guided-decoding-initialization
     """
 
     def __init__(self, vllm_config: "VllmConfig", device="cuda:0", is_pin_memory=True):
@@ -418,268 +416,6 @@ class NoOpLogitsProcessor(LogitsProcessor):
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         """Returns logits unchanged."""
-        return logits
-
-
-class BankingIntentLogitsProcessor(LogitsProcessor):
-    """
-    Constrains generation to only produce valid Banking77 intent labels.
-    Uses logits bias to force the model to generate token sequences that
-    match one of the 77 predefined banking intent categories.
-    """
-
-    def __init__(
-        self,
-        vllm_config: "VllmConfig",
-        device="cuda:0",
-        is_pin_memory=True,
-    ):
-        # Check if enabled via environment variable
-        env_enabled = os.environ.get(
-            'ENABLE_BANKING77_CONSTRAINTS', 'false'
-        ).lower()
-        eval_logger.info(
-            f"BankingIntentLogitsProcessor: ENABLE_BANKING77_CONSTRAINTS={env_enabled}"
-        )
-
-        # Get tokenizer using same pattern as ThinkingTokenBudgetLogitsProcessor
-        tokenizer_name = (
-            vllm_config.model_config.tokenizer
-            if vllm_config.model_config.tokenizer
-            else vllm_config.model_config.model
-        )
-        tokenizer = get_tokenizer(
-            tokenizer_name,
-            tokenizer_mode=vllm_config.model_config.tokenizer_mode,
-            trust_remote_code=vllm_config.model_config.trust_remote_code,
-            revision=vllm_config.model_config.tokenizer_revision,
-        )
-
-        # Define the 77 Banking77 intent labels
-        self.banking77_labels = [
-            "card_arrival", "card_linking", "exchange_rate",
-            "card_payment_wrong_exchange_rate", "extra_charge_on_statement",
-            "pending_cash_withdrawal", "fiat_currency_support",
-            "card_delivery_estimate", "automatic_top_up", "card_not_working",
-            "exchange_via_app", "lost_or_stolen_card", "age_limit",
-            "pin_blocked", "contactless_not_working",
-            "top_up_by_bank_transfer_charge", "pending_top_up",
-            "cancel_transfer", "top_up_limits",
-            "wrong_amount_of_cash_received", "card_payment_fee_charged",
-            "transfer_not_received_by_recipient",
-            "supported_cards_and_currencies", "getting_virtual_card",
-            "card_acceptance", "top_up_reverted",
-            "balance_not_updated_after_cheque_or_cash_deposit",
-            "card_payment_not_recognised", "edit_personal_details",
-            "why_verify_identity", "unable_to_verify_identity",
-            "get_physical_card", "visa_or_mastercard", "topping_up_by_card",
-            "disposable_card_limits", "compromised_card", "atm_support",
-            "direct_debit_payment_not_recognised", "passcode_forgotten",
-            "declined_cash_withdrawal", "pending_card_payment",
-            "lost_or_stolen_phone", "request_refund", "declined_transfer",
-            "Refund_not_showing_up",  # Note: uppercase R
-            "declined_card_payment", "pending_transfer", "terminate_account",
-            "card_swallowed", "transaction_charged_twice",
-            "verify_source_of_funds", "transfer_timing",
-            "reverted_card_payment?",  # Note: question mark
-            "change_pin", "beneficiary_not_allowed", "transfer_fee_charged",
-            "receiving_money", "failed_transfer", "transfer_into_account",
-            "verify_top_up", "getting_spare_card", "top_up_by_cash_or_cheque",
-            "order_physical_card", "virtual_card_not_working",
-            "wrong_exchange_rate_for_cash_withdrawal",
-            "get_disposable_virtual_card", "top_up_failed",
-            "balance_not_updated_after_bank_transfer",
-            "cash_withdrawal_not_recognised", "exchange_charge",
-            "top_up_by_card_charge", "activate_my_card",
-            "cash_withdrawal_charge", "card_about_to_expire",
-            "apple_pay_or_google_pay", "verify_my_identity",
-            "country_support",
-        ]
-
-        self.intent_prefix_ids = tokenizer.convert_tokens_to_ids(
-            tokenizer.tokenize("Intent: ")
-        )
-
-        # Tokenize each label and store as list of token sequences
-        # Format: List of [prefix_ids + label_ids] for each label
-        self.label_token_sequences = []
-        for label in self.banking77_labels:
-            label_ids = tokenizer.convert_tokens_to_ids(
-                tokenizer.tokenize(label)
-            )
-            # Prepend "Intent: " prefix to each label
-            full_sequence = self.intent_prefix_ids + label_ids
-            self.label_token_sequences.append(full_sequence)
-
-        # Find max sequence length for padding
-        self.max_seq_length = max(len(seq) for seq in self.label_token_sequences)
-
-        eval_logger.info(
-            f"BankingIntentLogitsProcessor: Tokenized {len(self.banking77_labels)} labels"
-        )
-        eval_logger.info(
-            f"BankingIntentLogitsProcessor: Intent prefix tokens: {self.intent_prefix_ids}"
-        )
-        eval_logger.info(
-            f"BankingIntentLogitsProcessor: Max sequence length: {self.max_seq_length}"
-        )
-
-        # Convert to numpy array and pad with -1 (invalid token marker)
-        import numpy as np
-        self.label_token_array = np.full(
-            (len(self.label_token_sequences), self.max_seq_length),
-            -1,
-            dtype=np.int64
-        )
-        for i, seq in enumerate(self.label_token_sequences):
-            self.label_token_array[i, :len(seq)] = seq
-
-        # Convert to GPU tensor
-        self.label_token_tensor = torch.tensor(
-            self.label_token_array,
-            dtype=torch.long,
-            device=device
-        )
-
-        # State tracking per request
-        self._state: dict[int, dict[str, Any]] = {}
-
-        # Preallocated tensors for batch operations
-        self.device = device
-        self.pin_memory = is_pin_memory
-
-        # Counter for apply() calls
-        self._apply_call_count = 0
-
-    def is_argmax_invariant(self) -> bool:
-        """Returns False because this processor modifies greedy sampling behavior."""
-        return False
-
-    def update_state(self, batch_update: Optional[BatchUpdate]) -> None:
-        """
-        Called by vLLM when batch composition changes.
-        Handles added/removed/moved requests.
-        """
-        if batch_update is None:
-            return
-
-        # Handle removed requests - cleanup state
-        if batch_update.removed:
-            for idx in batch_update.removed:
-                self._state.pop(idx, None)
-
-        # Handle added requests - initialize state
-        if batch_update.added:
-            for idx, params, prompt_tok_ids, output_tok_ids in (
-                batch_update.added
-            ):
-                # Initialize tracking for this request
-                self._state[idx] = {
-                    "tokens_generated": len(output_tok_ids),
-                    "valid_label_mask": torch.ones(
-                        len(self.label_token_sequences),
-                        dtype=torch.bool,
-                        device=self.device
-                    ),  # All labels valid initially
-                    "completed": False,
-                }
-
-        # Handle moved requests - reorder state dict
-        if batch_update.moved:
-            for i1, i2, direction in batch_update.moved:
-                if direction == MoveDirectionality.SWAP:
-                    self._state[i1], self._state[i2] = (
-                        self._state[i2], self._state[i1]
-                    )
-                else:
-                    self._state[i2] = self._state.pop(i1, {})
-
-    def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        """
-        Main method called during each decoding step.
-        Modifies logits to only allow tokens from valid label sequences.
-        """
-        # Check if we're running Banking77 task - no-op if not enabled
-        env_enabled = os.environ.get(
-            'ENABLE_BANKING77_CONSTRAINTS', 'false'
-        ).lower()
-
-        self._apply_call_count += 1
-
-        if env_enabled != 'true':
-            if self._apply_call_count == 1:
-                eval_logger.warning(
-                    "BankingIntentLogitsProcessor.apply(): Constraints DISABLED"
-                )
-            return logits
-
-        if not self._state:
-            return logits
-
-        batch_size = logits.size(0)
-
-        # Log on first active constraint application
-        if self._apply_call_count == 1 and self._state:
-            eval_logger.info(
-                f"BankingIntentLogitsProcessor.apply(): Applying constraints to batch_size={batch_size}"
-            )
-            eval_logger.info(
-                f"BankingIntentLogitsProcessor.apply(): Active states: {len(self._state)}"
-            )
-
-        for i in range(batch_size):
-            state = self._state.get(i)
-            if state is None or state["completed"]:
-                continue
-
-            position = state["tokens_generated"]
-            valid_mask = state["valid_label_mask"]
-
-            # If we've exceeded max sequence length, generation is done
-            if position >= self.max_seq_length:
-                state["completed"] = True
-                continue
-
-            # Get valid next tokens at this position
-            # Shape: (num_valid_labels,)
-            valid_next_tokens = self.label_token_tensor[valid_mask, position]
-
-            # Remove padding tokens (-1)
-            valid_next_tokens = valid_next_tokens[valid_next_tokens != -1]
-
-            # Get unique valid tokens
-            unique_tokens = torch.unique(valid_next_tokens)
-
-            # Log first constraint application details
-            if self._apply_call_count == 1 and i == 0:
-                eval_logger.info(
-                    f"BankingIntentLogitsProcessor.apply(): position={position}, "
-                    f"unique_tokens_count={len(unique_tokens)}"
-                )
-
-            if len(unique_tokens) == 0:
-                # No valid tokens - shouldn't happen, but handle gracefully
-                state["completed"] = True
-                continue
-
-            # Apply large positive bias to valid tokens
-            logits[i, unique_tokens] += 1e9
-
-            # Suppress all other tokens by setting very negative logits
-            # Create mask of valid tokens
-            suppress_mask = torch.ones(
-                logits.size(1), dtype=torch.bool, device=self.device
-            )
-            suppress_mask[unique_tokens] = False
-            logits[i, suppress_mask] = -1e9
-
-            # Update state for next iteration
-            state["tokens_generated"] += 1
-
-            # Check if we've completed any label sequences
-            if position == self.max_seq_length - 1:
-                state["completed"] = True
-
         return logits
 
 
@@ -853,17 +589,11 @@ class VLLM(TemplateLM):
                 "VLLM.__init__: Registered NoOpLogitsProcessor (ensures guided decoding initialization)"
             )
 
-        # Banking77 processor - DISABLED in favor of vLLM guided decoding with choice constraints
-        # NOTE: Custom logits processor was not being invoked. Now using guided_choice in generation_kwargs.
-        # processors.append(BankingIntentLogitsProcessor)
-        # eval_logger.info(
-        #     "VLLM.__init__: Registered BankingIntentLogitsProcessor"
-        # )
         eval_logger.info(
             f"VLLM.__init__: Total logits processors: {len(processors)}"
         )
         eval_logger.info(
-            "VLLM.__init__: Banking77 constrained decoding via guided_choice in generation_kwargs"
+            "VLLM.__init__: Banking77 constrained decoding via guided_choice (disabled when thinking enabled)"
         )
 
         # For vLLM v1, logits_processors go in engine_args, not model_args directly
@@ -1485,8 +1215,7 @@ class VLLM(TemplateLM):
 
         return continuation_logprobs, is_greedy
 
-    @staticmethod
-    def modify_gen_kwargs(kwargs: dict) -> dict:
+    def modify_gen_kwargs(self, kwargs: dict) -> dict:
         # sampling_params
         kwargs["temperature"] = kwargs.get("temperature", 0.0)
         do_sample = kwargs.pop("do_sample", None)
@@ -1502,11 +1231,16 @@ class VLLM(TemplateLM):
         )
 
         # Handle guided_choice for structured outputs (Banking77 constrained decoding)
+        # guided_choice conflicts with thinking tokens, so disable when enable_thinking=True
         guided_choice = kwargs.pop("guided_choice", None)
         if guided_choice is not None:
-            kwargs["structured_outputs"] = StructuredOutputsParams(choice=guided_choice)
-            # Add debug print to stderr (will appear in SLURM .err logs)
-            print(f"[BANKING77_DEBUG] Created StructuredOutputsParams with {len(guided_choice)} choices",
-                  flush=True, file=sys.stderr)
+            # Check if thinking is enabled - guided_choice blocks <think> tokens
+            if not self.enable_thinking:
+                kwargs["structured_outputs"] = StructuredOutputsParams(choice=guided_choice)
+                print(f"[BANKING77_DEBUG] Created StructuredOutputsParams with {len(guided_choice)} choices",
+                      flush=True, file=sys.stderr)
+            else:
+                print("[BANKING77_DEBUG] Skipping guided_choice (thinking enabled - conflicts with <think> tokens)",
+                      flush=True, file=sys.stderr)
 
         return kwargs
