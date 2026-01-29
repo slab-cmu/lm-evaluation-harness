@@ -522,16 +522,6 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
         # Counter for apply() calls
         self._apply_call_count = 0
 
-        # Write diagnostic on initialization
-        try:
-            with open('/tmp/banking77_processor_init.txt', 'w') as f:
-                f.write(f"Initialized successfully\n")
-                f.write(f"ENABLE_BANKING77_CONSTRAINTS={env_enabled}\n")
-                f.write(f"num_labels={len(self.banking77_labels)}\n")
-                f.write(f"max_seq_length={self.max_seq_length}\n")
-        except Exception as e:
-            pass
-
     def is_argmax_invariant(self) -> bool:
         """Returns False because this processor modifies greedy sampling behavior."""
         return False
@@ -586,16 +576,6 @@ class BankingIntentLogitsProcessor(LogitsProcessor):
         ).lower()
 
         self._apply_call_count += 1
-
-        # Write to diagnostic file on first call
-        if self._apply_call_count == 1:
-            try:
-                with open('/tmp/banking77_processor_active.txt', 'w') as f:
-                    f.write(f"ENABLE_BANKING77_CONSTRAINTS={env_enabled}\n")
-                    f.write(f"apply() called at least once\n")
-                    f.write(f"has_state={len(self._state) > 0}\n")
-            except Exception:
-                pass
 
         if env_enabled != 'true':
             if self._apply_call_count == 1:
