@@ -394,6 +394,33 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         return logits
 
 
+class NoOpLogitsProcessor(LogitsProcessor):
+    """
+    Minimal no-op logits processor to ensure vLLM initializes guided decoding correctly.
+
+    This processor does nothing but return logits unchanged. Its presence ensures that
+    vLLM v1 properly initializes the guided decoding backend (XGrammar) even when no
+    other logits processors are active.
+
+    See: https://github.com/vllm-project/vllm/issues/guided-decoding-initialization
+    """
+
+    def __init__(self, vllm_config: "VllmConfig", device="cuda:0", is_pin_memory=True):
+        pass
+
+    def is_argmax_invariant(self) -> bool:
+        """Returns True because this processor doesn't modify logits."""
+        return True
+
+    def update_state(self, batch_update: Optional[BatchUpdate]) -> None:
+        """No state to update."""
+        pass
+
+    def apply(self, logits: torch.Tensor) -> torch.Tensor:
+        """Returns logits unchanged."""
+        return logits
+
+
 class BankingIntentLogitsProcessor(LogitsProcessor):
     """
     Constrains generation to only produce valid Banking77 intent labels.
@@ -816,6 +843,14 @@ class VLLM(TemplateLM):
             processors.append(ThinkingTokenBudgetLogitsProcessor)
             eval_logger.info(
                 "VLLM.__init__: Registered ThinkingTokenBudgetLogitsProcessor"
+            )
+        else:
+            # For non-Thinking models, add a no-op processor to ensure vLLM
+            # initializes guided decoding backend correctly. Without any processor,
+            # vLLM v1 may not properly initialize XGrammar for structured outputs.
+            processors.append(NoOpLogitsProcessor)
+            eval_logger.info(
+                "VLLM.__init__: Registered NoOpLogitsProcessor (ensures guided decoding initialization)"
             )
 
         # Banking77 processor - DISABLED in favor of vLLM guided decoding with choice constraints
