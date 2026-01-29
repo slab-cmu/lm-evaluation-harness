@@ -2,6 +2,7 @@ import copy
 import gc
 import logging
 import os
+import sys
 from importlib.metadata import version
 from importlib.util import find_spec
 from multiprocessing import Process, Queue
@@ -34,6 +35,7 @@ from lm_eval.utils import (
 try:
     import ray
     from vllm import LLM, SamplingParams, TokensPrompt
+    from vllm.sampling_params import StructuredOutputsParams
     from vllm.config.model import ModelConfig
     from vllm.config.utils import config
     from vllm.lora.request import LoRARequest
@@ -816,13 +818,17 @@ class VLLM(TemplateLM):
                 "VLLM.__init__: Registered ThinkingTokenBudgetLogitsProcessor"
             )
 
-        # Always add Banking77 processor - it will check env var internally
-        processors.append(BankingIntentLogitsProcessor)
-        eval_logger.info(
-            "VLLM.__init__: Registered BankingIntentLogitsProcessor"
-        )
+        # Banking77 processor - DISABLED in favor of vLLM guided decoding with choice constraints
+        # NOTE: Custom logits processor was not being invoked. Now using guided_choice in generation_kwargs.
+        # processors.append(BankingIntentLogitsProcessor)
+        # eval_logger.info(
+        #     "VLLM.__init__: Registered BankingIntentLogitsProcessor"
+        # )
         eval_logger.info(
             f"VLLM.__init__: Total logits processors: {len(processors)}"
+        )
+        eval_logger.info(
+            "VLLM.__init__: Banking77 constrained decoding via guided_choice in generation_kwargs"
         )
 
         # For vLLM v1, logits_processors go in engine_args, not model_args directly
@@ -845,6 +851,9 @@ class VLLM(TemplateLM):
             self.model = LLM(
                 **self.model_args
             )
+            # Debug logging for Banking77 experiments
+            print(f"[BANKING77_DEBUG] vLLM model initialized successfully", flush=True, file=sys.stderr)
+            print(f"[BANKING77_DEBUG] Logits processors registered: {len(processors)}", flush=True, file=sys.stderr)
         else:
             eval_logger.warning(
                 "You might experience occasional issues with model weight downloading when data_parallel is in use. To ensure stable performance, run with data_parallel_size=1 until the weights are downloaded and cached."
@@ -1277,9 +1286,20 @@ class VLLM(TemplateLM):
                     context_encoding_truncated.append(x)
                 # create sampling params
                 kwargs = self.modify_gen_kwargs(kwargs)
+
+                # Debug print before creating SamplingParams
+                if "structured_outputs" in kwargs:
+                    print(f"[BANKING77_DEBUG] Creating SamplingParams with structured_outputs",
+                          flush=True, file=sys.stderr)
+
                 sampling_params.append(
                     SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)
                 )
+
+                # Debug print after creating SamplingParams
+                if hasattr(sampling_params[-1], 'structured_outputs') and sampling_params[-1].structured_outputs:
+                    print(f"[BANKING77_DEBUG] SamplingParams.structured_outputs configured: {sampling_params[-1].structured_outputs}",
+                          flush=True, file=sys.stderr)
 
             # perform batched generation
             cont = self._model_generate(
@@ -1445,4 +1465,13 @@ class VLLM(TemplateLM):
         kwargs["spaces_between_special_tokens"] = kwargs.get(
             "spaces_between_special_tokens", False
         )
+
+        # Handle guided_choice for structured outputs (Banking77 constrained decoding)
+        guided_choice = kwargs.pop("guided_choice", None)
+        if guided_choice is not None:
+            kwargs["structured_outputs"] = StructuredOutputsParams(choice=guided_choice)
+            # Add debug print to stderr (will appear in SLURM .err logs)
+            print(f"[BANKING77_DEBUG] Created StructuredOutputsParams with {len(guided_choice)} choices",
+                  flush=True, file=sys.stderr)
+
         return kwargs
