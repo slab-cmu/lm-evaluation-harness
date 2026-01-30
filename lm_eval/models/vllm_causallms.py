@@ -586,14 +586,11 @@ class VLLM(TemplateLM):
             # vLLM v1 may not properly initialize XGrammar for structured outputs.
             processors.append(NoOpLogitsProcessor)
             eval_logger.info(
-                "VLLM.__init__: Registered NoOpLogitsProcessor (ensures guided decoding initialization)"
+                "VLLM.__init__: Registered NoOpLogitsProcessor"
             )
 
         eval_logger.info(
             f"VLLM.__init__: Total logits processors: {len(processors)}"
-        )
-        eval_logger.info(
-            "VLLM.__init__: Banking77 constrained decoding via guided_choice (disabled when thinking enabled)"
         )
 
         # For vLLM v1, logits_processors go in engine_args, not model_args directly
