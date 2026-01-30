@@ -616,9 +616,9 @@ class VLLM(TemplateLM):
             self.model = LLM(
                 **self.model_args
             )
-            # Debug logging for Banking77 experiments
-            print(f"[BANKING77_DEBUG] vLLM model initialized successfully", flush=True, file=sys.stderr)
-            print(f"[BANKING77_DEBUG] Logits processors registered: {len(processors)}", flush=True, file=sys.stderr)
+
+            print("vLLM model initialized successfully", flush=True, file=sys.stderr)
+            print(f"Logits processors registered: {len(processors)}", flush=True, file=sys.stderr)
         else:
             eval_logger.warning(
                 "You might experience occasional issues with model weight downloading when data_parallel is in use. To ensure stable performance, run with data_parallel_size=1 until the weights are downloaded and cached."
@@ -1019,6 +1019,7 @@ class VLLM(TemplateLM):
         )
         # for each different set of kwargs, we execute all requests, by batch.
         eos = self.tokenizer.decode(self.eot_token_id)
+        _printed_structured_output_debug = False  # Only print once per batch
         for chunk in chunks:
             context_and_encoding, all_gen_kwargs = zip(*chunk)
             context, context_encoding = zip(*context_and_encoding)
@@ -1052,19 +1053,17 @@ class VLLM(TemplateLM):
                 # create sampling params
                 kwargs = self.modify_gen_kwargs(kwargs)
 
-                # Debug print before creating SamplingParams
-                if "structured_outputs" in kwargs:
-                    print(f"[BANKING77_DEBUG] Creating SamplingParams with structured_outputs",
-                          flush=True, file=sys.stderr)
-
                 sampling_params.append(
                     SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)
                 )
 
-                # Debug print after creating SamplingParams
-                if hasattr(sampling_params[-1], 'structured_outputs') and sampling_params[-1].structured_outputs:
-                    print(f"[BANKING77_DEBUG] SamplingParams.structured_outputs configured: {sampling_params[-1].structured_outputs}",
+                # Debug print after creating SamplingParams (only once per batch)
+                if not _printed_structured_output_debug and hasattr(sampling_params[-1], 'structured_outputs') and sampling_params[-1].structured_outputs:
+                    so = sampling_params[-1].structured_outputs
+                    choice_count = len(so.choice) if so.choice else 0
+                    print(f"[BANKING77_DEBUG] SamplingParams.structured_outputs configured with {choice_count} choices",
                           flush=True, file=sys.stderr)
+                    _printed_structured_output_debug = True
 
             # perform batched generation
             cont = self._model_generate(
@@ -1237,10 +1236,5 @@ class VLLM(TemplateLM):
             # Check if thinking is enabled - guided_choice blocks <think> tokens
             if not self.enable_thinking:
                 kwargs["structured_outputs"] = StructuredOutputsParams(choice=guided_choice)
-                print(f"[BANKING77_DEBUG] Created StructuredOutputsParams with {len(guided_choice)} choices",
-                      flush=True, file=sys.stderr)
-            else:
-                print("[BANKING77_DEBUG] Skipping guided_choice (thinking enabled - conflicts with <think> tokens)",
-                      flush=True, file=sys.stderr)
 
         return kwargs
