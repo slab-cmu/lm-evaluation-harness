@@ -461,7 +461,9 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         root = self.TrieNode()
 
         for choice_str in choice_strings:
-            token_ids = self._tokenizer.convert_tokens_to_ids(self._tokenizer.tokenize(choice_str))
+            token_ids = self._tokenizer.encode(choice_str, add_special_tokens=False)
+            assert -1 not in token_ids and self._tokenizer.unk_token_id not in token_ids, \
+                f"ConstrainedChoiceLogitsProcessor: choice {repr(choice_str)} produced unknown token id in {token_ids}"
             node = root
             for tid in token_ids:
                 if tid not in node.children:
@@ -480,12 +482,16 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 )
                 queue.extend(node.children.values())
 
-        # Log trie stats: root branching factor tells us how many distinct first tokens
-        # the choice strings start with
+        # Log trie stats to confirm tokenization and trie structure are correct.
+        # Sample: first 3 choices with their token ID sequences.
+        sample_encodings = [
+            (s, self._tokenizer.encode(s, add_special_tokens=False))
+            for s in choice_strings[:3]
+        ]
         print(
             f"[ConstrainedDecoding] Trie built: {len(choice_strings)} choices, "
             f"root has {len(root.children)} distinct first-token(s). "
-            f"First tokens (decoded): {[self._tokenizer.decode([t]) for t in list(root.children.keys())[:8]]}",
+            f"Sample encodings: {[(s, ids) for s, ids in sample_encodings]}",
             flush=True, file=sys.stderr
         )
         return root
@@ -1452,12 +1458,22 @@ class VLLM(TemplateLM):
 
         # Handle guided_choice: inject into extra_args for ConstrainedChoiceLogitsProcessor.
         # Works for both thinking models - constraints activate after </think>
-        # and instruct models - constraints active from token 0
+        # and instruct models - constraints active from token 0.
+        # Note: extra_args from gen_kwargs.yaml arrives as a list of single-key dicts;
+        # normalise it to a flat dict before adding our keys.
         guided_choice = kwargs.pop("guided_choice", None)
         if guided_choice is not None:
-            if "extra_args" not in kwargs or kwargs["extra_args"] is None:
+            existing = kwargs.get("extra_args", None)
+            if isinstance(existing, list):
+                # YAML list-of-dicts → flatten into a single dict
+                flat: dict = {}
+                for item in existing:
+                    if isinstance(item, dict):
+                        flat.update(item)
+                kwargs["extra_args"] = flat
+            elif existing is None:
                 kwargs["extra_args"] = {}
             kwargs["extra_args"]["constrained_choices"] = guided_choice
-            kwargs["extra_args"]["enable_thinking_for_constrained"] = self.enable_thinking
+            kwargs["extra_args"]["enable_thinking_for_constrained"] = bool(self.enable_thinking)
 
         return kwargs
