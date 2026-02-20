@@ -35,7 +35,6 @@ from lm_eval.utils import (
 try:
     import ray
     from vllm import LLM, SamplingParams, TokensPrompt
-    from vllm.sampling_params import StructuredOutputsParams
     from vllm.config.model import ModelConfig
     from vllm.config.utils import config
     from vllm.lora.request import LoRARequest
@@ -397,28 +396,263 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         return logits
 
 
-class NoOpLogitsProcessor(LogitsProcessor):
-    """
-    Minimal no-op logits processor to ensure vLLM initializes guided decoding correctly.
+def _find_sequence_index(target_list: list, token_ids: list) -> int:
+    """Returns the index of the last occurrence of token_ids in target_list, or -1."""
+    if not token_ids:
+        return -1
+    for i in range(len(target_list) - len(token_ids), -1, -1):
+        if target_list[i : i + len(token_ids)] == token_ids:
+            return i
+    return -1
 
-    This processor does nothing but return logits unchanged. Its presence ensures that
-    vLLM v1 properly initializes the guided decoding backend (XGrammar) even when no
-    other logits processors are active.
+
+class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
     """
+    Constrains generation to a fixed set of valid choice strings.
+
+    Activated per-request when 'constrained_choices' is present in SamplingParams.extra_args.
+
+    For thinking models (enable_thinking_for_constrained=True), constraints only activate
+    after '</think>' is detected in the output tokens. For non-thinking models, constraints
+    apply from the first generated token.
+    """
+
+    class TrieNode:
+        __slots__ = ("children", "is_terminal", "_valid_token_tensor")
+
+        def __init__(self):
+            self.children: dict = {}
+            self.is_terminal: bool = False
+            self._valid_token_tensor = None  # torch.Tensor, built after trie construction
 
     def __init__(self, vllm_config: "VllmConfig", device="cuda:0", is_pin_memory=True):
-        pass
+        self.device = device
+        self.pin_memory = is_pin_memory
+
+        tokenizer = get_tokenizer(
+            vllm_config.model_config.tokenizer if vllm_config.model_config.tokenizer else vllm_config.model_config.model,
+            tokenizer_mode=vllm_config.model_config.tokenizer_mode,
+            trust_remote_code=vllm_config.model_config.trust_remote_code,
+            revision=vllm_config.model_config.tokenizer_revision,
+        )
+        self._tokenizer = tokenizer
+
+        # Pre-tokenize </think> for thinking detection
+        self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
+
+        # Pre-compute EOS token IDs for use at terminal trie nodes
+        eos_ids = []
+        for tok in [tokenizer.eos_token_id]:
+            if tok is not None:
+                eos_ids.append(tok)
+        for tok_str in ["<|im_end|>", "<|eot_id|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok_str)
+            if tid is not None and tid != tokenizer.unk_token_id and tid not in eos_ids:
+                eos_ids.append(tid)
+        self.eos_token_ids = eos_ids
+        self.eos_token_ids_tensor = torch.tensor(eos_ids, dtype=torch.long, device=device) if eos_ids else None
+
+        self._trie_cache: dict = {}
+
+        self._state: dict = {}
+
+    def _build_trie(self, choice_strings: list) -> "ConstrainedChoiceLogitsProcessor.TrieNode":
+        """Build a token-level trie from a list of choice strings. Populates cached tensors on each node."""
+        root = self.TrieNode()
+
+        for choice_str in choice_strings:
+            token_ids = self._tokenizer.convert_tokens_to_ids(self._tokenizer.tokenize(choice_str))
+            node = root
+            for tid in token_ids:
+                if tid not in node.children:
+                    node.children[tid] = self.TrieNode()
+                node = node.children[tid]
+            node.is_terminal = True
+
+        # Populate cached valid-token tensors on every node (BFS)
+        from collections import deque
+        queue = deque([root])
+        while queue:
+            node = queue.popleft()
+            if node.children:
+                node._valid_token_tensor = torch.tensor(
+                    list(node.children.keys()), dtype=torch.long, device=self.device
+                )
+                queue.extend(node.children.values())
+
+        # Log trie stats: root branching factor tells us how many distinct first tokens
+        # the choice strings start with
+        print(
+            f"[ConstrainedDecoding] Trie built: {len(choice_strings)} choices, "
+            f"root has {len(root.children)} distinct first-token(s). "
+            f"First tokens (decoded): {[self._tokenizer.decode([t]) for t in list(root.children.keys())[:8]]}",
+            flush=True, file=sys.stderr
+        )
+        return root
+
+    def _scan_and_advance(self, state: dict):
+        """
+        Called from update_state() each step. Handles two responsibilities:
+        1. For thinking models: detect </think> and activate constrained decoding.
+        2. For constrained-active requests: advance trie position based on new tokens.
+        """
+        output = state["output_tok_ids"]
+        current_length = len(output)
+
+        # --- Part 1: detect </think> for thinking models ---
+        if state["enable_thinking"] and not state["constrained_active"]:
+            prev = state["prev_output_length"]
+            if current_length > prev:
+                state["prev_output_length"] = current_length
+                end_len = len(self.think_end_token_ids)
+                check_start = max(0, prev - end_len + 1)
+                recent = output[check_start:]
+                if _find_sequence_index(recent, self.think_end_token_ids) >= 0:
+                    state["constrained_active"] = True
+                    state["current_node"] = state["trie_root"]
+                    state["prev_output_length_constrained"] = current_length
+                    print(
+                        f"[ConstrainedDecoding] </think> detected at output token {current_length}. "
+                        f"Constrained decoding now active.",
+                        flush=True, file=sys.stderr
+                    )
+            return  # don't advance trie yet; will start on next call
+
+        # --- Part 2: advance trie for new tokens ---
+        if not state["constrained_active"] or state["completed"]:
+            return
+
+        prev_c = state["prev_output_length_constrained"]
+        if current_length <= prev_c:
+            return
+
+        new_tokens = output[prev_c:current_length]
+        state["prev_output_length_constrained"] = current_length
+
+        for tok_id in new_tokens:
+            node = state["current_node"]
+            if tok_id in node.children:
+                state["current_node"] = node.children[tok_id]
+            else:
+                eval_logger.warning(
+                    f"ConstrainedChoiceLogitsProcessor: unexpected token {tok_id} not in trie. Forcing EOS."
+                )
+                state["completed"] = True
+                return
+
+        if state["current_node"].is_terminal:
+            state["completed"] = True
+            if state.get("_log_completions", 0) < 3:
+                answer_start = state["prev_output_length_constrained"] - len(new_tokens)
+                decoded = self._tokenizer.decode(output[answer_start:])
+                print(
+                    f"[ConstrainedDecoding] Request completed trie traversal. "
+                    f"Answer tokens decoded: {repr(decoded)}",
+                    flush=True, file=sys.stderr
+                )
+                state["_log_completions"] = state.get("_log_completions", 0) + 1
 
     def is_argmax_invariant(self) -> bool:
-        """Returns True because this processor doesn't modify logits."""
-        return True
+        """Returns False: this processor changes greedy sampling by constraining valid tokens."""
+        return False
 
     def update_state(self, batch_update: Optional[BatchUpdate]) -> None:
-        """No state to update."""
-        pass
+        if batch_update is None:
+            # Still need to scan/advance for all active requests
+            for state in self._state.values():
+                if state.get("active"):
+                    self._scan_and_advance(state)
+            return
+
+        for index in batch_update.removed:
+            self._state.pop(index, None)
+
+        for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
+            extra = params.extra_args or {}
+            constrained_choices = extra.get("constrained_choices", None)
+
+            if constrained_choices is None:
+                self._state[index] = {"active": False}
+                continue
+
+            enable_thinking = extra.get("enable_thinking_for_constrained", False)
+
+            cache_key = tuple(constrained_choices)
+            if cache_key not in self._trie_cache:
+                self._trie_cache[cache_key] = self._build_trie(constrained_choices)
+                eval_logger.info(
+                    f"ConstrainedChoiceLogitsProcessor: built trie for {len(constrained_choices)} choices"
+                )
+            trie_root = self._trie_cache[cache_key]
+
+            # For instruct models: constrain from token 0. For thinking: wait for </think>.
+            constrained_active = not enable_thinking
+
+            # Log once on first activated request to confirm which case we are in
+            if not hasattr(self, "_logged_activation"):
+                mode = "waiting for </think>" if enable_thinking else "active from token 0"
+                print(
+                    f"[ConstrainedDecoding] First constrained request activated. "
+                    f"enable_thinking={enable_thinking}, constrained_active={constrained_active} ({mode})",
+                    flush=True, file=sys.stderr
+                )
+                self._logged_activation = True
+
+            self._state[index] = {
+                "active": True,
+                "trie_root": trie_root,
+                "current_node": trie_root,
+                "constrained_active": constrained_active,
+                "enable_thinking": enable_thinking,
+                "output_tok_ids": output_tok_ids,  # LIVE reference
+                "prev_output_length": len(output_tok_ids),
+                "prev_output_length_constrained": len(output_tok_ids),
+                "completed": False,
+            }
+
+        for i1, i2, direction in batch_update.moved:
+            if direction == MoveDirectionality.SWAP:
+                s1 = self._state.get(i1, {"active": False})
+                s2 = self._state.get(i2, {"active": False})
+                self._state[i1] = s2
+                self._state[i2] = s1
+            else:
+                self._state[i2] = self._state.pop(i1, {"active": False})
+
+        for state in self._state.values():
+            if state.get("active"):
+                self._scan_and_advance(state)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
-        """Returns logits unchanged."""
+        if not self._state:
+            return logits
+
+        batch_size = logits.size(0)
+
+        for i in range(batch_size):
+            state = self._state.get(i)
+            if not state or not state["active"] or not state["constrained_active"]:
+                continue
+
+            if state["completed"]:
+                # Allow only EOS/stop tokens
+                logits[i, :] = -1e9
+                if self.eos_token_ids_tensor is not None:
+                    logits[i, self.eos_token_ids_tensor] = 0.0
+                continue
+
+            # Constrain to valid next tokens from the current trie node
+            valid_tensor = state["current_node"]._valid_token_tensor
+            if valid_tensor is not None and len(valid_tensor) > 0:
+                logits[i, :] = -1e9
+                logits[i, valid_tensor] = 0.0
+            else:
+                # No valid children and not terminal — force EOS as safety fallback
+                state["completed"] = True
+                logits[i, :] = -1e9
+                if self.eos_token_ids_tensor is not None:
+                    logits[i, self.eos_token_ids_tensor] = 0.0
+
         return logits
 
 
@@ -583,28 +817,24 @@ class VLLM(TemplateLM):
             eval_logger.info(
                 "VLLM.__init__: Registered ThinkingTokenBudgetLogitsProcessor"
             )
-        else:
-            # For non-Thinking models, add a no-op processor to ensure vLLM
-            # initializes guided decoding backend correctly. Without any processor,
-            # vLLM v1 may not properly initialize XGrammar for structured outputs.
-            processors.append(NoOpLogitsProcessor)
-            eval_logger.info(
-                "VLLM.__init__: Registered NoOpLogitsProcessor"
-            )
+
+        # ConstrainedChoiceLogitsProcessor handles constrained decoding for Banking77 and
+        # any task that provides 'guided_choice' in gen_kwargs. It is a no-op for requests
+        # that do not include 'constrained_choices' in extra_args.
+        processors.append(ConstrainedChoiceLogitsProcessor)
+        eval_logger.info(
+            "VLLM.__init__: Registered ConstrainedChoiceLogitsProcessor"
+        )
 
         eval_logger.info(
             f"VLLM.__init__: Total logits processors: {len(processors)}"
         )
 
-        # For vLLM v1, logits_processors go in engine_args, not model_args directly
-        if self.V1 and processors:
-            # Store processors for later use - they'll be passed via engine config
+        if processors:
             self.model_args['logits_processors'] = processors
             eval_logger.info(
-                f"VLLM.__init__: Stored {len(processors)} processors for vLLM v1"
+                f"VLLM.__init__: Stored {len(processors)} processors"
             )
-        elif processors:
-            self.model_args['logits_processors'] = processors
 
         self.model_args.update(kwargs)
         self.batch_size = (
@@ -1019,7 +1249,6 @@ class VLLM(TemplateLM):
         )
         # for each different set of kwargs, we execute all requests, by batch.
         eos = self.tokenizer.decode(self.eot_token_id)
-        _printed_structured_output_debug = False  # Only print once per batch
         for chunk in chunks:
             context_and_encoding, all_gen_kwargs = zip(*chunk)
             context, context_encoding = zip(*context_and_encoding)
@@ -1056,14 +1285,6 @@ class VLLM(TemplateLM):
                 sampling_params.append(
                     SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)
                 )
-
-                # Debug print after creating SamplingParams (only once per batch)
-                if not _printed_structured_output_debug and hasattr(sampling_params[-1], 'structured_outputs') and sampling_params[-1].structured_outputs:
-                    so = sampling_params[-1].structured_outputs
-                    choice_count = len(so.choice) if so.choice else 0
-                    print(f"[BANKING77_DEBUG] SamplingParams.structured_outputs configured with {choice_count} choices",
-                          flush=True, file=sys.stderr)
-                    _printed_structured_output_debug = True
 
             # perform batched generation
             cont = self._model_generate(
@@ -1229,12 +1450,14 @@ class VLLM(TemplateLM):
             "spaces_between_special_tokens", False
         )
 
-        # Handle guided_choice for structured outputs (Banking77 constrained decoding)
-        # guided_choice conflicts with thinking tokens, so disable when enable_thinking=True
+        # Handle guided_choice: inject into extra_args for ConstrainedChoiceLogitsProcessor.
+        # Works for both thinking models - constraints activate after </think>
+        # and instruct models - constraints active from token 0
         guided_choice = kwargs.pop("guided_choice", None)
         if guided_choice is not None:
-            # Check if thinking is enabled - guided_choice blocks <think> tokens
-            if not self.enable_thinking:
-                kwargs["structured_outputs"] = StructuredOutputsParams(choice=guided_choice)
+            if "extra_args" not in kwargs or kwargs["extra_args"] is None:
+                kwargs["extra_args"] = {}
+            kwargs["extra_args"]["constrained_choices"] = guided_choice
+            kwargs["extra_args"]["enable_thinking_for_constrained"] = self.enable_thinking
 
         return kwargs
