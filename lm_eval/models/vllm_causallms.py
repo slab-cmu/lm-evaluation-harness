@@ -40,7 +40,10 @@ try:
     from vllm.config.utils import config
     from vllm.lora.request import LoRARequest
     from vllm.transformers_utils.tokenizer import get_tokenizer, init_tokenizer_from_configs
-    from vllm.utils import get_open_port
+    try:
+        from vllm.utils.network_utils import get_open_port  # type: ignore
+    except (ModuleNotFoundError, ImportError):
+        from vllm.utils import get_open_port
     from vllm.v1.sample.logits_processor.interface import (
         BatchUpdate,
         LogitsProcessor,
