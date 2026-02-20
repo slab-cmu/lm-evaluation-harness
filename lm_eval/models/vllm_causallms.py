@@ -540,6 +540,29 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             if tok_id in node.children:
                 state["current_node"] = node.children[tok_id]
             else:
+                # Decode the full output so far and the trie root's valid first tokens
+                # to understand what was generated vs. what was expected.
+                try:
+                    decoded_output = self._tokenizer.decode(output)
+                    decoded_bad_token = self._tokenizer.decode([tok_id]) if tok_id >= 0 else f"<sentinel:{tok_id}>"
+                    root_valid = list(state["trie_root"].children.keys())[:8]
+                    decoded_root_valid = [self._tokenizer.decode([t]) for t in root_valid]
+                    current_valid = list(node.children.keys())
+                    decoded_current_valid = [self._tokenizer.decode([t]) for t in current_valid]
+                    print(
+                        f"[ConstrainedDecoding] UNEXPECTED TOKEN\n"
+                        f"  bad token id={tok_id}, decoded={repr(decoded_bad_token)}\n"
+                        f"  output_tok_ids (last 10)={output[-10:]}\n"
+                        f"  decoded output (last 50 chars)={repr(decoded_output[-50:])}\n"
+                        f"  current trie node valid children ids={current_valid}\n"
+                        f"  current trie node valid children decoded={decoded_current_valid}\n"
+                        f"  trie root valid first tokens decoded={decoded_root_valid}\n"
+                        f"  prev_output_length_constrained={prev_c}, current_length={current_length}",
+                        flush=True, file=sys.stderr
+                    )
+                except Exception as log_err:
+                    print(f"[ConstrainedDecoding] UNEXPECTED TOKEN id={tok_id} (logging failed: {log_err})",
+                          flush=True, file=sys.stderr)
                 eval_logger.warning(
                     f"ConstrainedChoiceLogitsProcessor: unexpected token {tok_id} not in trie. Forcing EOS."
                 )
@@ -594,12 +617,13 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             # For instruct models: constrain from token 0. For thinking: wait for </think>.
             constrained_active = not enable_thinking
 
-            # Log once on first activated request to confirm which case we are in
+            # Log once on first activated request: confirm case and initial output_tok_ids state
             if not hasattr(self, "_logged_activation"):
                 mode = "waiting for </think>" if enable_thinking else "active from token 0"
                 print(
                     f"[ConstrainedDecoding] First constrained request activated. "
-                    f"enable_thinking={enable_thinking}, constrained_active={constrained_active} ({mode})",
+                    f"enable_thinking={enable_thinking}, constrained_active={constrained_active} ({mode}). "
+                    f"output_tok_ids at admission (len={len(output_tok_ids)}): {list(output_tok_ids)[:5]}",
                     flush=True, file=sys.stderr
                 )
                 self._logged_activation = True
