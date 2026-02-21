@@ -657,6 +657,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 print(
                     f"[ConstrainedDecoding] First constrained request activated. "
                     f"enable_thinking={enable_thinking}, constrained_active={constrained_active} ({mode}). "
+                    f"batch_update index={index} (this is the key in _state, must match logits row). "
                     f"output_tok_ids at admission (len={len(output_tok_ids)}): {list(output_tok_ids)[:5]}",
                     flush=True, file=sys.stderr
                 )
@@ -725,6 +726,13 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             if valid_tensor is not None and len(valid_tensor) > 0:
                 logits[i, :] = -1e9
                 logits[i, valid_tensor] = 0.0
+                if log_count < 5:
+                    top_after = int(logits[i].argmax().item())
+                    print(
+                        f"[CD:apply step={self._apply_step}] row={i} after constraint: "
+                        f"top_token={top_after}, valid={valid_tensor.tolist()}",
+                        flush=True, file=sys.stderr
+                    )
             else:
                 # No valid children and not terminal — force EOS as safety fallback
                 state["completed"] = True
