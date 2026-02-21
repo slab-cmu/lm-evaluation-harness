@@ -552,19 +552,26 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             return
 
         new_tokens = output[prev_c:current_length]
-        state["prev_output_length_constrained"] = current_length
+
+        # The last entry in output_tok_ids is a vLLM write-ahead sentinel (-1) for
+        # the token currently being decoded. Strip trailing sentinels so we only
+        # advance the bookmark and the trie over real, committed tokens. Without
+        # this, prev_output_length_constrained moves past the sentinel position,
+        # causing the real token (which later overwrites the -1 in-place) to be
+        # skipped entirely on the next call — leaving the trie stuck at the root.
+        real_end = len(new_tokens)
+        while real_end > 0 and new_tokens[real_end - 1] < 0:
+            real_end -= 1
+        new_tokens = new_tokens[:real_end]
+
+        if not new_tokens:
+            return
+
+        state["prev_output_length_constrained"] = prev_c + real_end
 
         for tok_id in new_tokens:
-            # Guard against vLLM sentinel values (e.g. INVALID_TOKEN_ID = -1) that
-            # appear before the first real decode token is written to output_tok_ids.
-            if tok_id < 0:
-                print(
-                    f"[CD:scan] Skipping sentinel token id={tok_id} (vLLM pre-decode placeholder)",
-                    flush=True, file=sys.stderr
-                )
-                continue
             node = state["current_node"]
-            if tok_id in node.children:
+            if tok_id in node.children:  # tok_id is guaranteed >= 0 here
                 state["current_node"] = node.children[tok_id]
             else:
                 # Decode the full output so far and the trie root's valid first tokens
