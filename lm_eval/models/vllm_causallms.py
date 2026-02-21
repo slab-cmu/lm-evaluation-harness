@@ -505,6 +505,18 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         output = state["output_tok_ids"]
         current_length = len(output)
 
+        # Step-level debug log: shows pipeline ordering and state on every scan call.
+        print(
+            f"[CD:scan] constrained_active={state.get('constrained_active')}, "
+            f"enable_thinking={state.get('enable_thinking')}, "
+            f"completed={state.get('completed')}, "
+            f"output_len={current_length}, "
+            f"prev_c={state.get('prev_output_length_constrained')}, "
+            f"prev={state.get('prev_output_length')}, "
+            f"output[-3:]={list(output[-3:]) if len(output) >= 3 else list(output)}",
+            flush=True, file=sys.stderr
+        )
+
         # --- Part 1: detect </think> for thinking models ---
         if state["enable_thinking"] and not state["constrained_active"]:
             prev = state["prev_output_length"]
@@ -513,6 +525,13 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 end_len = len(self.think_end_token_ids)
                 check_start = max(0, prev - end_len + 1)
                 recent = output[check_start:]
+                print(
+                    f"[CD:think_scan] output_len={current_length}, prev={prev}, "
+                    f"check_start={check_start}, recent={list(recent)}, "
+                    f"think_end_ids={self.think_end_token_ids}, "
+                    f"found={_find_sequence_index(recent, self.think_end_token_ids)}",
+                    flush=True, file=sys.stderr
+                )
                 if _find_sequence_index(recent, self.think_end_token_ids) >= 0:
                     state["constrained_active"] = True
                     state["current_node"] = state["trie_root"]
@@ -536,6 +555,14 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         state["prev_output_length_constrained"] = current_length
 
         for tok_id in new_tokens:
+            # Guard against vLLM sentinel values (e.g. INVALID_TOKEN_ID = -1) that
+            # appear before the first real decode token is written to output_tok_ids.
+            if tok_id < 0:
+                print(
+                    f"[CD:scan] Skipping sentinel token id={tok_id} (vLLM pre-decode placeholder)",
+                    flush=True, file=sys.stderr
+                )
+                continue
             node = state["current_node"]
             if tok_id in node.children:
                 state["current_node"] = node.children[tok_id]
@@ -658,11 +685,26 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             return logits
 
         batch_size = logits.size(0)
+        self._apply_step = getattr(self, "_apply_step", 0) + 1
 
         for i in range(batch_size):
             state = self._state.get(i)
             if not state or not state["active"] or not state["constrained_active"]:
                 continue
+
+            # Per-row apply debug: log the first 5 constrained apply calls per row.
+            log_key = f"_apply_log_count_{i}"
+            log_count = state.get(log_key, 0)
+            if log_count < 5:
+                node_children = list(state["current_node"].children.keys())[:5]
+                print(
+                    f"[CD:apply step={self._apply_step}] row={i}, "
+                    f"completed={state['completed']}, "
+                    f"node_children={node_children}, "
+                    f"output_len={len(state['output_tok_ids'])}",
+                    flush=True, file=sys.stderr
+                )
+                state[log_key] = log_count + 1
 
             if state["completed"]:
                 # Allow only EOS/stop tokens
