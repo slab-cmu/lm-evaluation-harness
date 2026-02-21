@@ -496,124 +496,37 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         )
         return root
 
-    def _scan_and_advance(self, state: dict):
+    def _scan_for_think_end(self, state: dict):
         """
-        Called from update_state() each step. Handles two responsibilities:
-        1. For thinking models: detect </think> and activate constrained decoding.
-        2. For constrained-active requests: advance trie position based on new tokens.
+        For thinking models only: scan output_tok_ids for </think> and activate
+        constrained decoding when found. Called from update_state() each step.
+
+        Trie advancement is handled in apply() directly, keyed off apply_count,
+        because output_tok_ids has a vLLM write-ahead sentinel (-1) at the last
+        position that makes it unreliable for tracking committed tokens.
         """
         output = state["output_tok_ids"]
         current_length = len(output)
+        prev = state["prev_output_length"]
 
-        # Step-level debug log: shows pipeline ordering and state on every scan call.
-        print(
-            f"[CD:scan] constrained_active={state.get('constrained_active')}, "
-            f"enable_thinking={state.get('enable_thinking')}, "
-            f"completed={state.get('completed')}, "
-            f"output_len={current_length}, "
-            f"prev_c={state.get('prev_output_length_constrained')}, "
-            f"prev={state.get('prev_output_length')}, "
-            f"output[-3:]={list(output[-3:]) if len(output) >= 3 else list(output)}",
-            flush=True, file=sys.stderr
-        )
-
-        # --- Part 1: detect </think> for thinking models ---
-        if state["enable_thinking"] and not state["constrained_active"]:
-            prev = state["prev_output_length"]
-            if current_length > prev:
-                state["prev_output_length"] = current_length
-                end_len = len(self.think_end_token_ids)
-                check_start = max(0, prev - end_len + 1)
-                recent = output[check_start:]
-                print(
-                    f"[CD:think_scan] output_len={current_length}, prev={prev}, "
-                    f"check_start={check_start}, recent={list(recent)}, "
-                    f"think_end_ids={self.think_end_token_ids}, "
-                    f"found={_find_sequence_index(recent, self.think_end_token_ids)}",
-                    flush=True, file=sys.stderr
-                )
-                if _find_sequence_index(recent, self.think_end_token_ids) >= 0:
-                    state["constrained_active"] = True
-                    state["current_node"] = state["trie_root"]
-                    state["prev_output_length_constrained"] = current_length
-                    print(
-                        f"[ConstrainedDecoding] </think> detected at output token {current_length}. "
-                        f"Constrained decoding now active.",
-                        flush=True, file=sys.stderr
-                    )
-            return  # don't advance trie yet; will start on next call
-
-        # --- Part 2: advance trie for new tokens ---
-        if not state["constrained_active"] or state["completed"]:
+        if current_length <= prev:
             return
 
-        prev_c = state["prev_output_length_constrained"]
-        if current_length <= prev_c:
-            return
+        state["prev_output_length"] = current_length
+        end_len = len(self.think_end_token_ids)
+        check_start = max(0, prev - end_len + 1)
+        # Exclude the trailing sentinel when scanning
+        recent = [t for t in output[check_start:] if t >= 0]
 
-        new_tokens = output[prev_c:current_length]
-
-        # The last entry in output_tok_ids is a vLLM write-ahead sentinel (-1) for
-        # the token currently being decoded. Strip trailing sentinels so we only
-        # advance the bookmark and the trie over real, committed tokens. Without
-        # this, prev_output_length_constrained moves past the sentinel position,
-        # causing the real token (which later overwrites the -1 in-place) to be
-        # skipped entirely on the next call — leaving the trie stuck at the root.
-        real_end = len(new_tokens)
-        while real_end > 0 and new_tokens[real_end - 1] < 0:
-            real_end -= 1
-        new_tokens = new_tokens[:real_end]
-
-        if not new_tokens:
-            return
-
-        state["prev_output_length_constrained"] = prev_c + real_end
-
-        for tok_id in new_tokens:
-            node = state["current_node"]
-            if tok_id in node.children:  # tok_id is guaranteed >= 0 here
-                state["current_node"] = node.children[tok_id]
-            else:
-                # Decode the full output so far and the trie root's valid first tokens
-                # to understand what was generated vs. what was expected.
-                try:
-                    decoded_output = self._tokenizer.decode(output)
-                    decoded_bad_token = self._tokenizer.decode([tok_id]) if tok_id >= 0 else f"<sentinel:{tok_id}>"
-                    root_valid = list(state["trie_root"].children.keys())[:8]
-                    decoded_root_valid = [self._tokenizer.decode([t]) for t in root_valid]
-                    current_valid = list(node.children.keys())
-                    decoded_current_valid = [self._tokenizer.decode([t]) for t in current_valid]
-                    print(
-                        f"[ConstrainedDecoding] UNEXPECTED TOKEN\n"
-                        f"  bad token id={tok_id}, decoded={repr(decoded_bad_token)}\n"
-                        f"  output_tok_ids (last 10)={output[-10:]}\n"
-                        f"  decoded output (last 50 chars)={repr(decoded_output[-50:])}\n"
-                        f"  current trie node valid children ids={current_valid}\n"
-                        f"  current trie node valid children decoded={decoded_current_valid}\n"
-                        f"  trie root valid first tokens decoded={decoded_root_valid}\n"
-                        f"  prev_output_length_constrained={prev_c}, current_length={current_length}",
-                        flush=True, file=sys.stderr
-                    )
-                except Exception as log_err:
-                    print(f"[ConstrainedDecoding] UNEXPECTED TOKEN id={tok_id} (logging failed: {log_err})",
-                          flush=True, file=sys.stderr)
-                eval_logger.warning(
-                    f"ConstrainedChoiceLogitsProcessor: unexpected token {tok_id} not in trie. Forcing EOS."
-                )
-                state["completed"] = True
-                return
-
-        if state["current_node"].is_terminal:
-            state["completed"] = True
-            if state.get("_log_completions", 0) < 3:
-                answer_start = state["prev_output_length_constrained"] - len(new_tokens)
-                decoded = self._tokenizer.decode(output[answer_start:])
-                print(
-                    f"[ConstrainedDecoding] Request completed trie traversal. "
-                    f"Answer tokens decoded: {repr(decoded)}",
-                    flush=True, file=sys.stderr
-                )
-                state["_log_completions"] = state.get("_log_completions", 0) + 1
+        if _find_sequence_index(recent, self.think_end_token_ids) >= 0:
+            state["constrained_active"] = True
+            state["current_node"] = state["trie_root"]
+            state["apply_count"] = 0
+            print(
+                f"[ConstrainedDecoding] </think> detected at output token {current_length}. "
+                f"Constrained decoding now active.",
+                flush=True, file=sys.stderr
+            )
 
     def is_argmax_invariant(self) -> bool:
         """Returns False: this processor changes greedy sampling by constraining valid tokens."""
@@ -676,7 +589,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 "enable_thinking": enable_thinking,
                 "output_tok_ids": output_tok_ids,  # LIVE reference
                 "prev_output_length": len(output_tok_ids),
-                "prev_output_length_constrained": len(output_tok_ids),
+                "apply_count": 0,  # how many apply() calls have fired for this request
                 "completed": False,
             }
 
@@ -690,8 +603,8 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 self._state[i2] = self._state.pop(i1, {"active": False})
 
         for state in self._state.values():
-            if state.get("active"):
-                self._scan_and_advance(state)
+            if state.get("active") and state.get("enable_thinking") and not state.get("constrained_active"):
+                self._scan_for_think_end(state)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._state:
@@ -705,29 +618,60 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             if not state or not state["active"] or not state["constrained_active"]:
                 continue
 
-            # Per-row apply debug: log the first 5 constrained apply calls per row.
+            # Advance trie using the token committed by the PREVIOUS apply call.
+            # output_tok_ids[apply_count - 1] is the committed token from the last
+            # step. We read it here rather than in update_state() because vLLM writes
+            # the committed token into the live list asynchronously: at update_state()
+            # time the slot still holds the -1 sentinel; by apply() time it is filled.
+            apply_count = state["apply_count"]
+            if apply_count > 0 and not state["completed"]:
+                output = state["output_tok_ids"]
+                prev_idx = apply_count - 1
+                if prev_idx < len(output):
+                    prev_tok = output[prev_idx]
+                    if prev_tok >= 0:
+                        node = state["current_node"]
+                        if prev_tok in node.children:
+                            state["current_node"] = node.children[prev_tok]
+                            if state["current_node"].is_terminal:
+                                state["completed"] = True
+                                if state.get("_log_completions", 0) < 3:
+                                    print(
+                                        f"[ConstrainedDecoding] Request completed trie traversal. "
+                                        f"Answer decoded: {repr(self._tokenizer.decode(output[:apply_count]))}",
+                                        flush=True, file=sys.stderr
+                                    )
+                                    state["_log_completions"] = state.get("_log_completions", 0) + 1
+                        else:
+                            eval_logger.warning(
+                                f"ConstrainedChoiceLogitsProcessor: committed token {prev_tok} "
+                                f"({repr(self._tokenizer.decode([prev_tok]))}) not in trie at depth {apply_count}. "
+                                f"Valid: {list(node.children.keys())}. Forcing EOS."
+                            )
+                            state["completed"] = True
+
+            state["apply_count"] = apply_count + 1
+
+            # Log first 5 apply calls per row
             log_key = f"_apply_log_count_{i}"
             log_count = state.get(log_key, 0)
             if log_count < 5:
                 node_children = list(state["current_node"].children.keys())[:5]
                 print(
                     f"[CD:apply step={self._apply_step}] row={i}, "
-                    f"completed={state['completed']}, "
+                    f"apply_count={apply_count}, completed={state['completed']}, "
                     f"node_is_root={state['current_node'] is state['trie_root']}, "
-                    f"node_children={node_children}, "
-                    f"output_len={len(state['output_tok_ids'])}",
+                    f"node_children={node_children}",
                     flush=True, file=sys.stderr
                 )
                 state[log_key] = log_count + 1
 
             if state["completed"]:
-                # Allow only EOS/stop tokens
                 logits[i, :] = -1e9
                 if self.eos_token_ids_tensor is not None:
                     logits[i, self.eos_token_ids_tensor] = 0.0
                 continue
 
-            # Constrain to valid next tokens from the current trie node
             valid_tensor = state["current_node"]._valid_token_tensor
             if valid_tensor is not None and len(valid_tensor) > 0:
                 logits[i, :] = -1e9
@@ -740,7 +684,6 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                         flush=True, file=sys.stderr
                     )
             else:
-                # No valid children and not terminal — force EOS as safety fallback
                 state["completed"] = True
                 logits[i, :] = -1e9
                 if self.eos_token_ids_tensor is not None:
