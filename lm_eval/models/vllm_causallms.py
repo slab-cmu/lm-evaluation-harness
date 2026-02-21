@@ -534,10 +534,10 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
 
     def update_state(self, batch_update: Optional[BatchUpdate]) -> None:
         if batch_update is None:
-            # Still need to scan/advance for all active requests
+            # Scan for </think> on thinking models; trie advancement happens in apply()
             for state in self._state.values():
-                if state.get("active"):
-                    self._scan_and_advance(state)
+                if state.get("active") and state.get("enable_thinking") and not state.get("constrained_active"):
+                    self._scan_for_think_end(state)
             return
 
         for index in batch_update.removed:
