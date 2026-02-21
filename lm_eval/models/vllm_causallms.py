@@ -631,6 +631,11 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             self._state.pop(index, None)
 
         for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
+            print(
+                f"[CD:added] index={index}, output_tok_ids_len={len(output_tok_ids)}, "
+                f"already_in_state={index in self._state}",
+                flush=True, file=sys.stderr
+            )
             extra = params.extra_args or {}
             constrained_choices = extra.get("constrained_choices", None)
 
@@ -708,6 +713,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 print(
                     f"[CD:apply step={self._apply_step}] row={i}, "
                     f"completed={state['completed']}, "
+                    f"node_is_root={state['current_node'] is state['trie_root']}, "
                     f"node_children={node_children}, "
                     f"output_len={len(state['output_tok_ids'])}",
                     flush=True, file=sys.stderr
