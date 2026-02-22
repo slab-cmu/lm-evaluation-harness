@@ -589,7 +589,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 "enable_thinking": enable_thinking,
                 "output_tok_ids": output_tok_ids,  # LIVE reference
                 "prev_output_length": len(output_tok_ids),
-                "apply_count": 0,  # how many apply() calls have fired for this request
+                "apply_count": len(output_tok_ids),  # how many apply() calls have fired for this request
                 "completed": False,
             }
 
@@ -674,8 +674,9 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
 
             valid_tensor = state["current_node"]._valid_token_tensor
             if valid_tensor is not None and len(valid_tensor) > 0:
-                logits[i, :] = -1e9
-                logits[i, valid_tensor] = 0.0
+                mask = torch.full_like(logits[i], -1e9)
+                mask[valid_tensor] = logits[i, valid_tensor]
+                logits[i] = mask
                 if log_count < 5:
                     top_after = int(logits[i].argmax().item())
                     print(
