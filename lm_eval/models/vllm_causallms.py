@@ -499,7 +499,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         For thinking models only: scan output_tok_ids for </think> and activate
         constrained decoding when found. Called from update_state() each step.
 
-        Trie advancement is handled in apply() directly, keyed off apply_count,
+        Trie advancement is handled in apply() directly via next_read_idx,
         because output_tok_ids has a vLLM write-ahead sentinel (-1) at the last
         position that makes it unreliable for tracking committed tokens.
         """
@@ -519,7 +519,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         if _find_sequence_index(recent, self.think_end_token_ids) >= 0:
             state["constrained_active"] = True
             state["current_node"] = state["trie_root"]
-            state["apply_count"] = 0
+            state["next_read_idx"] = len(output)  # start consuming from here, after </think>
             print(
                 f"[ConstrainedDecoding] </think> detected at output token {current_length}. "
                 f"Constrained decoding now active.",
@@ -581,7 +581,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 "enable_thinking": enable_thinking,
                 "output_tok_ids": output_tok_ids,  # LIVE reference
                 "prev_output_length": len(output_tok_ids),
-                "apply_count": len(output_tok_ids),  # how many apply() calls have fired for this request
+                "next_read_idx": len(output_tok_ids),  # index of next token to consume from output_tok_ids
                 "completed": False,
             }
 
@@ -609,97 +609,67 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             if not state or not state["active"] or not state["constrained_active"]:
                 continue
 
-            # Advance trie using the token committed by the PREVIOUS apply call.
-            # output_tok_ids[apply_count - 1] is the committed token from the last
-            # step. We read it here rather than in update_state() because vLLM writes
-            # the committed token into the live list asynchronously: at update_state()
-            # time the slot still holds the -1 sentinel; by apply() time it is filled.
-            apply_count = state["apply_count"]
-            if apply_count > 0 and not state["completed"]:
+            # Advance trie by consuming all newly committed tokens since last apply().
+            # next_read_idx tracks the next unread position in output_tok_ids and only
+            # advances when a real (non-sentinel) token is successfully consumed. This
+            # keeps it in sync with output_tok_ids regardless of timing or batch gaps.
+            if not state["completed"]:
                 output = state["output_tok_ids"]
-                prev_idx = apply_count - 1
-                if prev_idx < len(output):
-                    prev_tok = output[prev_idx]
-                    if prev_tok >= 0:
-                        node = state["current_node"]
-                        if prev_tok in node.children:
-                            state["current_node"] = node.children[prev_tok]
-                            if state["current_node"].is_terminal:
-                                state["completed"] = True
-                                print(
-                                    f"[ConstrainedDecoding] Request completed trie traversal. "
-                                    f"Answer decoded: {repr(self._tokenizer.decode(output[:apply_count]))}",
-                                    flush=True, file=sys.stderr
-                                )
-                        else:
+                while state["next_read_idx"] < len(output):
+                    tok = output[state["next_read_idx"]]
+                    if tok < 0:
+                        break  # sentinel, not yet committed — stop and retry next step
+                    node = state["current_node"]
+                    if tok in node.children:
+                        state["current_node"] = node.children[tok]
+                        state["next_read_idx"] += 1
+                        if state["current_node"].is_terminal:
+                            state["completed"] = True
                             print(
-                                f"[ConstrainedDecoding] WARNING: committed token {prev_tok} "
-                                f"({repr(self._tokenizer.decode([prev_tok]))}) not in trie at depth {apply_count}. "
-                                f"Valid: {list(node.children.keys())}. Forcing EOS.",
+                                f"[ConstrainedDecoding] Request completed trie traversal. "
+                                f"Answer decoded: {repr(self._tokenizer.decode(output[:state['next_read_idx']]))}",
                                 flush=True, file=sys.stderr
                             )
-                            state["completed"] = True
-
-            state["apply_count"] = apply_count + 1
-
-            # Loop detection: warn if stuck at root for more than 1 consecutive step
-            if not state["completed"]:
-                at_root = state["current_node"] is state["trie_root"]
-                if at_root:
-                    root_steps = state.get("_root_steps", 0) + 1
-                    state["_root_steps"] = root_steps
-                    if root_steps == 2:
-                        # First time we confirm the loop — diagnose why trie didn't advance
-                        output = state["output_tok_ids"]
-                        prev_idx = apply_count - 1  # apply_count already incremented above
-                        if apply_count == 0:
-                            reason = "apply_count==0, lookback skipped"
-                        elif prev_idx >= len(output):
-                            reason = f"prev_idx={prev_idx} >= len(output)={len(output)}, index out of range"
-                        else:
-                            prev_tok = output[prev_idx]
-                            if prev_tok < 0:
-                                reason = f"prev_tok={prev_tok} is sentinel (-1), not yet committed"
-                            elif prev_tok not in state["trie_root"].children:
-                                reason = (
-                                    f"prev_tok={prev_tok} ({repr(self._tokenizer.decode([prev_tok]))}) "
-                                    f"not in trie root's children {list(state['trie_root'].children.keys())[:8]}"
-                                )
-                            else:
-                                reason = f"prev_tok={prev_tok} IS in root children — trie should have advanced, unexpected"
+                            break
+                    else:
                         print(
-                            f"[ConstrainedDecoding] DIAG: row={i} root-stuck diagnosis: {reason}. "
-                            f"apply_count={apply_count}, len(output_tok_ids)={len(output)}, "
-                            f"output_tok_ids[:8]={list(output[:8])}",
+                            f"[ConstrainedDecoding] WARNING: committed token {tok} "
+                            f"({repr(self._tokenizer.decode([tok]))}) not in trie at depth {state['next_read_idx']}. "
+                            f"Valid: {list(node.children.keys())}. Forcing EOS.",
                             flush=True, file=sys.stderr
                         )
-                    elif root_steps > 2 and root_steps % 500 == 0:
+                        state["completed"] = True
+                        break
+
+            # Loop detection: warn if stuck at root for more than 1 consecutive step.
+            # Loop detection: warn if stuck at root for multiple steps while output is non-empty.
+            # next_read_idx == len(output) means we've consumed all committed tokens so far
+            # (waiting for more), which is normal. Being at root with unconsumed tokens is not.
+            if not state["completed"]:
+                at_root = state["current_node"] is state["trie_root"]
+                has_unconsumed = state["next_read_idx"] < len(state["output_tok_ids"])
+                if at_root and has_unconsumed:
+                    root_steps = state.get("_root_steps", 0) + 1
+                    state["_root_steps"] = root_steps
+                    if root_steps == 1:
+                        output = state["output_tok_ids"]
+                        next_tok = output[state["next_read_idx"]] if state["next_read_idx"] < len(output) else None
                         print(
-                            f"[ConstrainedDecoding] WARNING: row={i} stuck at trie root for "
-                            f"{root_steps} consecutive steps (apply_count={apply_count}).",
+                            f"[ConstrainedDecoding] WARNING: row={i} at trie root with unconsumed tokens. "
+                            f"next_read_idx={state['next_read_idx']}, len(output)={len(output)}, "
+                            f"next_tok={next_tok} ({repr(self._tokenizer.decode([next_tok])) if next_tok is not None and next_tok >= 0 else next_tok}), "
+                            f"root_children={list(state['trie_root'].children.keys())[:8]}",
+                            flush=True, file=sys.stderr
+                        )
+                    elif root_steps % 500 == 0:
+                        print(
+                            f"[ConstrainedDecoding] WARNING: row={i} still stuck at trie root, "
+                            f"{root_steps} steps, next_read_idx={state['next_read_idx']}, "
+                            f"len(output)={len(state['output_tok_ids'])}.",
                             flush=True, file=sys.stderr
                         )
                 else:
                     state["_root_steps"] = 0
-
-            # Loop detection: warn if same token emitted 4 times in a row
-            if apply_count > 0 and not state["completed"]:
-                output = state["output_tok_ids"]
-                if apply_count - 1 < len(output):
-                    last_tok = output[apply_count - 1]
-                    if last_tok >= 0:
-                        history = state.setdefault("_tok_history", [])
-                        history.append(last_tok)
-                        if len(history) > 4:
-                            history.pop(0)
-                        if len(history) == 4 and len(set(history)) == 1:
-                            print(
-                                f"[ConstrainedDecoding] WARNING: row={i} emitting same token {last_tok} "
-                                f"({repr(self._tokenizer.decode([last_tok]))}) 4 times in a row. "
-                                f"apply_count={apply_count}, "
-                                f"node_is_root={state['current_node'] is state['trie_root']}",
-                                flush=True, file=sys.stderr
-                            )
 
             if state["completed"]:
                 logits[i, :] = -1e9
