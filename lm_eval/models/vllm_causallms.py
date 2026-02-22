@@ -482,8 +482,6 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 )
                 queue.extend(node.children.values())
 
-        # Log trie stats to confirm tokenization and trie structure are correct.
-        # Sample: first 3 choices with their token ID sequences.
         sample_encodings = [
             (s, self._tokenizer.encode(s, add_special_tokens=False))
             for s in choice_strings[:3]
@@ -544,11 +542,6 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             self._state.pop(index, None)
 
         for index, params, prompt_tok_ids, output_tok_ids in batch_update.added:
-            print(
-                f"[CD:added] index={index}, output_tok_ids_len={len(output_tok_ids)}, "
-                f"already_in_state={index in self._state}",
-                flush=True, file=sys.stderr
-            )
             extra = params.extra_args or {}
             constrained_choices = extra.get("constrained_choices", None)
 
@@ -561,22 +554,21 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             cache_key = tuple(constrained_choices)
             if cache_key not in self._trie_cache:
                 self._trie_cache[cache_key] = self._build_trie(constrained_choices)
-                eval_logger.info(
-                    f"ConstrainedChoiceLogitsProcessor: built trie for {len(constrained_choices)} choices"
+                print(
+                    f"[ConstrainedDecoding] Built trie for {len(constrained_choices)} choices",
+                    flush=True, file=sys.stderr
                 )
             trie_root = self._trie_cache[cache_key]
 
             # For instruct models: constrain from token 0. For thinking: wait for </think>.
             constrained_active = not enable_thinking
 
-            # Log once on first activated request: confirm case and initial output_tok_ids state
+            # Log once on first activated request: confirm activation mode
             if not hasattr(self, "_logged_activation"):
                 mode = "waiting for </think>" if enable_thinking else "active from token 0"
                 print(
                     f"[ConstrainedDecoding] First constrained request activated. "
-                    f"enable_thinking={enable_thinking}, constrained_active={constrained_active} ({mode}). "
-                    f"batch_update index={index} (this is the key in _state, must match logits row). "
-                    f"output_tok_ids at admission (len={len(output_tok_ids)}): {list(output_tok_ids)[:5]}",
+                    f"enable_thinking={enable_thinking}, constrained_active={constrained_active} ({mode}).",
                     flush=True, file=sys.stderr
                 )
                 self._logged_activation = True
@@ -611,7 +603,6 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             return logits
 
         batch_size = logits.size(0)
-        self._apply_step = getattr(self, "_apply_step", 0) + 1
 
         for i in range(batch_size):
             state = self._state.get(i)
@@ -635,36 +626,56 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                             state["current_node"] = node.children[prev_tok]
                             if state["current_node"].is_terminal:
                                 state["completed"] = True
-                                if state.get("_log_completions", 0) < 3:
-                                    print(
-                                        f"[ConstrainedDecoding] Request completed trie traversal. "
-                                        f"Answer decoded: {repr(self._tokenizer.decode(output[:apply_count]))}",
-                                        flush=True, file=sys.stderr
-                                    )
-                                    state["_log_completions"] = state.get("_log_completions", 0) + 1
+                                print(
+                                    f"[ConstrainedDecoding] Request completed trie traversal. "
+                                    f"Answer decoded: {repr(self._tokenizer.decode(output[:apply_count]))}",
+                                    flush=True, file=sys.stderr
+                                )
                         else:
-                            eval_logger.warning(
-                                f"ConstrainedChoiceLogitsProcessor: committed token {prev_tok} "
+                            print(
+                                f"[ConstrainedDecoding] WARNING: committed token {prev_tok} "
                                 f"({repr(self._tokenizer.decode([prev_tok]))}) not in trie at depth {apply_count}. "
-                                f"Valid: {list(node.children.keys())}. Forcing EOS."
+                                f"Valid: {list(node.children.keys())}. Forcing EOS.",
+                                flush=True, file=sys.stderr
                             )
                             state["completed"] = True
 
             state["apply_count"] = apply_count + 1
 
-            # Log first 5 apply calls per row
-            log_key = f"_apply_log_count_{i}"
-            log_count = state.get(log_key, 0)
-            if log_count < 5:
-                node_children = list(state["current_node"].children.keys())[:5]
-                print(
-                    f"[CD:apply step={self._apply_step}] row={i}, "
-                    f"apply_count={apply_count}, completed={state['completed']}, "
-                    f"node_is_root={state['current_node'] is state['trie_root']}, "
-                    f"node_children={node_children}",
-                    flush=True, file=sys.stderr
-                )
-                state[log_key] = log_count + 1
+            # Loop detection: warn if stuck at root for more than 1 consecutive step
+            if not state["completed"]:
+                at_root = state["current_node"] is state["trie_root"]
+                if at_root:
+                    state["_root_steps"] = state.get("_root_steps", 0) + 1
+                    if state["_root_steps"] > 1:
+                        print(
+                            f"[ConstrainedDecoding] WARNING: row={i} stuck at trie root for "
+                            f"{state['_root_steps']} consecutive steps "
+                            f"(apply_count={apply_count}). "
+                            f"output_tok_ids[:5]={list(state['output_tok_ids'][:5])}",
+                            flush=True, file=sys.stderr
+                        )
+                else:
+                    state["_root_steps"] = 0
+
+            # Loop detection: warn if same token emitted 4 times in a row
+            if apply_count > 0 and not state["completed"]:
+                output = state["output_tok_ids"]
+                if apply_count - 1 < len(output):
+                    last_tok = output[apply_count - 1]
+                    if last_tok >= 0:
+                        history = state.setdefault("_tok_history", [])
+                        history.append(last_tok)
+                        if len(history) > 4:
+                            history.pop(0)
+                        if len(history) == 4 and len(set(history)) == 1:
+                            print(
+                                f"[ConstrainedDecoding] WARNING: row={i} emitting same token {last_tok} "
+                                f"({repr(self._tokenizer.decode([last_tok]))}) 4 times in a row. "
+                                f"apply_count={apply_count}, "
+                                f"node_is_root={state['current_node'] is state['trie_root']}",
+                                flush=True, file=sys.stderr
+                            )
 
             if state["completed"]:
                 logits[i, :] = -1e9
@@ -677,13 +688,6 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 mask = torch.full_like(logits[i], -1e9)
                 mask[valid_tensor] = logits[i, valid_tensor]
                 logits[i] = mask
-                if log_count < 5:
-                    top_after = int(logits[i].argmax().item())
-                    print(
-                        f"[CD:apply step={self._apply_step}] row={i} after constraint: "
-                        f"top_token={top_after}, valid={valid_tensor.tolist()}",
-                        flush=True, file=sys.stderr
-                    )
             else:
                 state["completed"] = True
                 logits[i, :] = -1e9
