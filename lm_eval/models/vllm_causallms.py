@@ -646,13 +646,37 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             if not state["completed"]:
                 at_root = state["current_node"] is state["trie_root"]
                 if at_root:
-                    state["_root_steps"] = state.get("_root_steps", 0) + 1
-                    if state["_root_steps"] > 1:
+                    root_steps = state.get("_root_steps", 0) + 1
+                    state["_root_steps"] = root_steps
+                    if root_steps == 2:
+                        # First time we confirm the loop — diagnose why trie didn't advance
+                        output = state["output_tok_ids"]
+                        prev_idx = apply_count - 1  # apply_count already incremented above
+                        if apply_count == 0:
+                            reason = "apply_count==0, lookback skipped"
+                        elif prev_idx >= len(output):
+                            reason = f"prev_idx={prev_idx} >= len(output)={len(output)}, index out of range"
+                        else:
+                            prev_tok = output[prev_idx]
+                            if prev_tok < 0:
+                                reason = f"prev_tok={prev_tok} is sentinel (-1), not yet committed"
+                            elif prev_tok not in state["trie_root"].children:
+                                reason = (
+                                    f"prev_tok={prev_tok} ({repr(self._tokenizer.decode([prev_tok]))}) "
+                                    f"not in trie root's children {list(state['trie_root'].children.keys())[:8]}"
+                                )
+                            else:
+                                reason = f"prev_tok={prev_tok} IS in root children — trie should have advanced, unexpected"
+                        print(
+                            f"[ConstrainedDecoding] DIAG: row={i} root-stuck diagnosis: {reason}. "
+                            f"apply_count={apply_count}, len(output_tok_ids)={len(output)}, "
+                            f"output_tok_ids[:8]={list(output[:8])}",
+                            flush=True, file=sys.stderr
+                        )
+                    elif root_steps > 2 and root_steps % 500 == 0:
                         print(
                             f"[ConstrainedDecoding] WARNING: row={i} stuck at trie root for "
-                            f"{state['_root_steps']} consecutive steps "
-                            f"(apply_count={apply_count}). "
-                            f"output_tok_ids[:5]={list(state['output_tok_ids'][:5])}",
+                            f"{root_steps} consecutive steps (apply_count={apply_count}).",
                             flush=True, file=sys.stderr
                         )
                 else:
