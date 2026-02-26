@@ -264,17 +264,8 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 state["in_end"] = True
                 state["end_count"] = 0
                 state["check_count_down"] = state["thinking_token_budget_max"]
-        else:
-            # In end mode
-            state["end_count"] += 1
-            if state["end_count"] >= len(self.think_termination_token_ids):
-                state.update(
-                    {
-                        "in_end": False,
-                        "end_count": 0,
-                        "check_count_down": state["thinking_token_budget_max"],
-                    }
-                )
+        # Note: in_end mode advancement (end_count, in_end -> False) is handled in apply(),
+        # not here, to avoid the off-by-one where end_count increments before apply() reads it.
 
     def is_argmax_invariant(self) -> bool:
         """This logits processor can change the outcome of
