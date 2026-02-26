@@ -540,7 +540,9 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
 
         state["prev_output_length"] = current_length
         end_len = len(self.think_end_token_ids)
-        check_start = max(0, prev - end_len + 1)
+        # Look back end_len tokens before prev to catch sequences that landed in the
+        # previous window but whose sentinel wasn't yet committed when we last scanned.
+        check_start = max(0, prev - end_len)
         # Exclude the trailing sentinel when scanning
         recent = [t for t in output[check_start:] if t >= 0]
 
