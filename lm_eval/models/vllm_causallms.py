@@ -132,8 +132,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         self, prompt_tok_ids: Optional[list[int]], thinking_token_budget_max: int, thinking_token_budget_min: int, answer_prefix_ids:[list[int]], continuation_mode: str
     ) -> dict[str, Any]:
         """Initializes the tracking state for a given sequence index."""
+        # Build a per-request copy so different requests don't corrupt the shared list.
+        termination_token_ids = list(self.think_termination_token_ids)
         if answer_prefix_ids is not None:
-            self.think_termination_token_ids.extend(answer_prefix_ids)
+            termination_token_ids.extend(answer_prefix_ids)
 
         if prompt_tok_ids is None:
             last_start = -1
@@ -154,6 +156,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 )
             else:
                 think_count = 0
+
         return {
             "in_think": in_think,  # Currently in thinking mode
             "in_end": in_think and thinking_token_budget_max == 0,
