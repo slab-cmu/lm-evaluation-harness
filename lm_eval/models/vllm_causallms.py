@@ -1085,8 +1085,8 @@ class VLLM(TemplateLM):
         if not isinstance(sampling_params, List):
             sampling_params = [sampling_params] * len(requests)
 
-        answer_prefix_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(self.answer_prefix))
         if self.answer_prefix is not None:
+            answer_prefix_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.tokenize(self.answer_prefix))
             for sample_params in sampling_params:
                 if sample_params.extra_args is None:
                     sample_params.extra_args = {}
