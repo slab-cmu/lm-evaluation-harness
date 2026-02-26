@@ -343,8 +343,8 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     self.force_token_ids[i] = self.think_continuation_token_ids[state['continuation_count']]
 
             # Suppress </think> if under the required budget
-            if len(state['output_tok_ids']) < state['thinking_token_budget_min']:
-                logits[:, self.think_end_token_ids[0]] = 0
+            if state and len(state['output_tok_ids']) < state['thinking_token_budget_min']:
+                logits[i, self.think_end_token_ids[0]] = -1e9
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
