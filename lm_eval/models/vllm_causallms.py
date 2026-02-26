@@ -322,28 +322,52 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         self.mask[:batch_size] = False
 
         for i in range(batch_size):
-            state = self._state.get(i)
-            if state and state["in_end"]:
+            row_state = self._state.get(i)
+            if row_state and row_state["in_end"]:
                 self.mask[i] = True
-                self.force_token_ids[i] = self.think_termination_token_ids[state['end_count']]
+                termination_token_ids = row_state["termination_token_ids"]
+                self.force_token_ids[i] = termination_token_ids[row_state['end_count']]
+                # Advance end_count here so apply() owns the full in_end lifecycle,
+                # avoiding the off-by-one where _update_think_state increments before
+                # apply() reads end_count.
+                if row_state['end_count'] == 0:
+                    print(
+                        f"[ThinkingBudget] Request index={i}: forcing termination sequence "
+                        f"({len(termination_token_ids)} tokens), "
+                        f"think_count={row_state['think_count']}, "
+                        f"budget=[{row_state['thinking_token_budget_min']}, {row_state['thinking_token_budget_max']}]",
+                        flush=True, file=sys.stderr
+                    )
+                row_state['end_count'] += 1
+                if row_state['end_count'] >= len(termination_token_ids):
+                    row_state['in_end'] = False
+                    row_state['end_count'] = 0
+                    row_state['in_think'] = False
+                    row_state['think_count'] = 0
+                    row_state['check_count_down'] = row_state['thinking_token_budget_max']
+                    print(
+                        f"[ThinkingBudget] Request index={i}: termination sequence complete, "
+                        f"output_tok_ids length={len(row_state['output_tok_ids'])}",
+                        flush=True, file=sys.stderr
+                    )
 
             # Either begin continuation sequence if </think> is present; or if already in continuation
-            if state and (
-                (state["in_continuation"] == True and state['continuation_count'] < len(self.think_continuation_token_ids)
+            if row_state and (
+                (row_state["in_continuation"] == True and row_state['continuation_count'] < len(self.think_continuation_token_ids)
             ) or (
                 torch.argmax(logits) == self.think_end_token_ids[0]
-                and len(state['output_tok_ids']) < state['thinking_token_budget_min']
+                and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']
             )):
-                state["in_continuation"] = True
+                row_state["in_continuation"] = True
                 self.mask[i] = True
                 if (
-                    state["continuation_mode"] == "wait" 
-                    and state['continuation_count'] < len(self.think_continuation_token_ids)
+                    row_state["continuation_mode"] == "wait"
+                    and row_state['continuation_count'] < len(self.think_continuation_token_ids)
                 ):
-                    self.force_token_ids[i] = self.think_continuation_token_ids[state['continuation_count']]
+                    self.force_token_ids[i] = self.think_continuation_token_ids[row_state['continuation_count']]
 
             # Suppress </think> if under the required budget
-            if state and len(state['output_tok_ids']) < state['thinking_token_budget_min']:
+            if row_state and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']:
                 logits[i, self.think_end_token_ids[0]] = -1e9
 
         # Check in CPU first not to sync with GPU
@@ -372,24 +396,26 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         # Increment the tracker on the continuation sequence or reset if done
         for i in range(batch_size):
-            state = self._state.get(i)
-            if state["continuation_mode"] == "suppress_end_think":
-                state['in_continuation'] = False
-                state['continuation_count'] = 0
+            row_state = self._state.get(i)
+            if row_state is None:
+                continue
+            if row_state["continuation_mode"] == "suppress_end_think":
+                row_state['in_continuation'] = False
+                row_state['continuation_count'] = 0
             elif (
-                state["continuation_mode"] == "wait" and state['in_continuation']
-                and state['continuation_count'] < len(self.think_continuation_token_ids)
-            ): 
-                state['continuation_count'] += 1
-            elif(
-                state["continuation_mode"] == "wait"
-                and state['continuation_count'] >= len(self.think_continuation_token_ids)
+                row_state["continuation_mode"] == "wait" and row_state['in_continuation']
+                and row_state['continuation_count'] < len(self.think_continuation_token_ids)
             ):
-                state.update(
+                row_state['continuation_count'] += 1
+            elif (
+                row_state["continuation_mode"] == "wait"
+                and row_state['continuation_count'] >= len(self.think_continuation_token_ids)
+            ):
+                row_state.update(
                     {
                         "in_continuation": False,
                         "continuation_count": 0,
-                        "check_count_down": state["thinking_token_budget_max"] - state['think_count'],
+                        "check_count_down": row_state["thinking_token_budget_max"] - row_state['think_count'],
                     }
                 )
 
