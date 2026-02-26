@@ -171,7 +171,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             "thinking_token_budget_max": thinking_token_budget_max,
             "thinking_token_budget_min": float(thinking_token_budget_min),
             "prev_output_length": 0,
-            # Track previous output length for incremental updates
+            "termination_token_ids": termination_token_ids,
         }
 
     def _update_think_state(self, state: dict[str, Any]):
