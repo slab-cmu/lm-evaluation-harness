@@ -662,10 +662,10 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                         state["completed"] = True
                         break
 
-            # Loop detection: warn if stuck at root for more than 1 consecutive step.
-            # Loop detection: warn if stuck at root for multiple steps while output is non-empty.
-            # next_read_idx == len(output) means we've consumed all committed tokens so far
-            # (waiting for more), which is normal. Being at root with unconsumed tokens is not.
+            # Loop detection: warn if stuck at root with unconsumed tokens.
+            # next_read_idx == len(output) means we're waiting for more commits, which is normal.
+            # Being at root with unconsumed tokens means a committed token wasn't in the trie,
+            # which should have triggered the WARNING+completed path above.
             if not state["completed"]:
                 at_root = state["current_node"] is state["trie_root"]
                 has_unconsumed = state["next_read_idx"] < len(state["output_tok_ids"])
