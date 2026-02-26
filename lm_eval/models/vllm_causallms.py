@@ -378,21 +378,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             state.get("in_continuation", False) for state in self._state.values()
         )
 
-        if has_active_thinking and state["in_end"]:
+        if has_active_thinking or has_active_continuation:
             current_mask = self.mask[:batch_size]
             active_indices = current_mask.nonzero(as_tuple=False).view(-1)
             if len(active_indices) > 0:
                 force_tokens = self.force_token_ids[active_indices]
-                # Apply a large value for the end thinking token id index
                 logits[active_indices, force_tokens] = 1e9
-
-
-        if has_active_continuation and state["continuation_mode"] == "wait":
-            current_mask = self.mask[:batch_size]
-            active_indices = current_mask.nonzero(as_tuple=False).view(-1)
-            # Also, force large logit value for continuation sequence token
-            force_tokens = self.force_token_ids[active_indices]
-            logits[active_indices, force_tokens] = 1e9
 
         # Increment the tracker on the continuation sequence or reset if done
         for i in range(batch_size):
