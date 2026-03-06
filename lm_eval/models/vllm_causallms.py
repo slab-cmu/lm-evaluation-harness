@@ -295,14 +295,6 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                         prompt_tok_ids, thinking_token_budget_max, thinking_token_budget_min, answer_prefix_ids, continuation_mode
                     )
                     self._state[index]["output_tok_ids"] = output_tok_ids
-                    print(
-                        f"[ThinkingBudget] Request index={index} registered: "
-                        f"budget=[{thinking_token_budget_min}, {thinking_token_budget_max}], "
-                        f"in_think={self._state[index]['in_think']}, "
-                        f"in_end={self._state[index]['in_end']}, "
-                        f"think_count={self._state[index]['think_count']}",
-                        flush=True, file=sys.stderr
-                    )
                 else:
                     # Remove state if no thinking budget
                     self._state.pop(index, None)
