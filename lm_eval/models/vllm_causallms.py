@@ -82,7 +82,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         self.think_start_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<think>"))
         self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("Let's verify this solution"))
-        self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>")) 
+        self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
+        # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary (from its
+        # tool-use training distribution). Suppress it under min budget alongside </think>.
+        self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
         self.think_termination_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(
             # self.tokenizer.tokenize("</think>\n\n The answer is:")
             # TODO: This could be intercepted with prefill rather than decoding, but we'll do drop in replacement for now for performance scaling.
@@ -245,12 +248,16 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 # Continue thinking mode, increment count by new tokens
                 state["think_count"] += len(new_tokens)
 
-            # Set countdown based on current state
+            # Set countdown based on current state.
+            # Cap at (remaining - termination_len) so the termination sequence can always
+            # be forced before max_gen_toks is exhausted. Without this, at high budgets
+            # check_count_down ≈ budget_max and the countdown never reaches 0 in time.
             if state["in_think"]:
                 remaining_budget = max(
-                    0, state["thinking_token_budget_max"] - state["think_count"], 
-                    )
-                state["check_count_down"] = remaining_budget
+                    0, state["thinking_token_budget_max"] - state["think_count"],
+                )
+                term_len = len(state["termination_token_ids"])
+                state["check_count_down"] = max(1, remaining_budget - term_len)
             else:
                 state["check_count_down"] = state["thinking_token_budget_max"]
 
@@ -368,9 +375,13 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 ):
                     self.force_token_ids[i] = self.think_continuation_token_ids[row_state['continuation_count']]
 
-            # Suppress </think> if under the required budget
+            # Suppress </think> and <tool_call> if under the required budget.
+            # Qwen3 uses <tool_call> as an alternative think-exit boundary, so we must
+            # suppress it the same way we suppress </think>.
             if row_state and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']:
                 logits[i, self.think_end_token_ids[0]] = -1e9
+                if self.tool_call_token_ids:
+                    logits[i, self.tool_call_token_ids[0]] = -1e9
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
@@ -456,8 +467,10 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         )
         self._tokenizer = tokenizer
 
-        # Pre-tokenize </think> for thinking detection
+        # Pre-tokenize </think> and <tool_call> for thinking detection.
+        # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary.
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
+        self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
 
         # Pre-compute EOS token IDs for use at terminal trie nodes
         eos_ids = []
@@ -515,8 +528,11 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
 
     def _scan_for_think_end(self, state: dict):
         """
-        For thinking models only: scan output_tok_ids for </think> and activate
-        constrained decoding when found. Called from update_state() each step.
+        For thinking models only: scan output_tok_ids for </think> or <tool_call> and
+        activate constrained decoding when found. Called from update_state() each step.
+
+        Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary (from its
+        tool-use training distribution), so we treat it the same as </think> here.
 
         Trie advancement is handled in apply() directly via next_read_idx,
         because output_tok_ids has a vLLM write-ahead sentinel (-1) at the last
@@ -530,19 +546,25 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             return
 
         state["prev_output_length"] = current_length
-        end_len = len(self.think_end_token_ids)
-        # Look back end_len tokens before prev to catch sequences that landed in the
-        # previous window but whose sentinel wasn't yet committed when we last scanned.
-        check_start = max(0, prev - end_len)
+        # Look back far enough to catch either boundary sequence spanning windows.
+        max_boundary_len = max(len(self.think_end_token_ids), len(self.tool_call_token_ids)) if self.tool_call_token_ids else len(self.think_end_token_ids)
+        check_start = max(0, prev - max_boundary_len)
         # Exclude the trailing sentinel when scanning
         recent = [t for t in output[check_start:] if t >= 0]
 
-        if _find_sequence_index(recent, self.think_end_token_ids) >= 0:
+        found_boundary = _find_sequence_index(recent, self.think_end_token_ids) >= 0
+        boundary_token = "</think>"
+        if not found_boundary and self.tool_call_token_ids:
+            if _find_sequence_index(recent, self.tool_call_token_ids) >= 0:
+                found_boundary = True
+                boundary_token = "<tool_call>"
+
+        if found_boundary:
             state["constrained_active"] = True
             state["current_node"] = state["trie_root"]
-            state["next_read_idx"] = len(output)  # start consuming from here, after </think>
+            state["next_read_idx"] = len(output)  # start consuming from here, after boundary
             print(
-                f"[ConstrainedDecoding] </think> detected at output token {current_length}. "
+                f"[ConstrainedDecoding] {boundary_token} detected at output token {current_length}. "
                 f"Constrained decoding now active.",
                 flush=True, file=sys.stderr
             )
@@ -1353,8 +1375,13 @@ class VLLM(TemplateLM):
             for output, context in zip(cont, context):
                 generated_text: str = output.outputs[0].text
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
+
+                # Note: think_end_token stripping is intentionally skipped here so that
+                # thinking traces are preserved in the logged samples (resps field).
+                # Filters (e.g. regex) in the task config extract the final answer from
+                # filtered_resps, so scoring is unaffected.
                 generated_text = postprocess_generated_text(
-                    generated_text, until, self.think_end_token
+                    generated_text, until, think_end_token=None
                 )
                 res.append(generated_text)
                 self.cache_hook.add_partial(
