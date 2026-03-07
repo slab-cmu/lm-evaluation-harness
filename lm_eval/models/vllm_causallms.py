@@ -199,14 +199,6 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         if current_length <= prev_length:
             return
 
-        print(
-            f"[ThinkingBudget] countdown expired: think_count={state.get('think_count')}, "
-            f"budget=[{state.get('thinking_token_budget_min')}, {state.get('thinking_token_budget_max')}], "
-            f"new_tokens={current_length - prev_length}, output_len={current_length}, "
-            f"in_think={state.get('in_think')}, in_end={state.get('in_end')}",
-            flush=True, file=sys.stderr
-        )
-
         # Process only newly added tokens
         new_tokens = output[prev_length:]
         state["prev_output_length"] = current_length
@@ -291,12 +283,6 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 )
                 term_len = len(state["termination_token_ids"])
                 state["check_count_down"] = min(max(1, remaining_budget - term_len), 256)
-                print(
-                    f"[ThinkingBudget] countdown set: think_count={state['think_count']}, "
-                    f"remaining={remaining_budget}, term_len={term_len}, "
-                    f"check_count_down={state['check_count_down']}",
-                    flush=True, file=sys.stderr
-                )
             elif not state["in_end"]:
                 state["check_count_down"] = state["thinking_token_budget_max"]
         # Note: in_end mode advancement (end_count, in_end -> False) is handled in apply(),
