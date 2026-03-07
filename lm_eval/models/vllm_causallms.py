@@ -86,6 +86,11 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary (from its
         # tool-use training distribution). Suppress it under min budget alongside </think>.
         self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
+        print(
+            f"[ThinkingBudget] init: think_end_token_ids={self.think_end_token_ids}, "
+            f"tool_call_token_ids={self.tool_call_token_ids}",
+            flush=True, file=sys.stderr
+        )
         self.think_termination_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(
             # self.tokenizer.tokenize("</think>\n\n The answer is:")
             # TODO: This could be intercepted with prefill rather than decoding, but we'll do drop in replacement for now for performance scaling.
@@ -194,6 +199,14 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         if current_length <= prev_length:
             return
 
+        print(
+            f"[ThinkingBudget] countdown expired: think_count={state.get('think_count')}, "
+            f"budget=[{state.get('thinking_token_budget_min')}, {state.get('thinking_token_budget_max')}], "
+            f"new_tokens={current_length - prev_length}, output_len={current_length}, "
+            f"in_think={state.get('in_think')}, in_end={state.get('in_end')}",
+            flush=True, file=sys.stderr
+        )
+
         # Process only newly added tokens
         new_tokens = output[prev_length:]
         state["prev_output_length"] = current_length
@@ -248,20 +261,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 # Continue thinking mode, increment count by new tokens
                 state["think_count"] += len(new_tokens)
 
-            # Set countdown based on current state.
-            # Cap at (remaining - termination_len) so the termination sequence can always
-            # be forced before max_gen_toks is exhausted. Without this, at high budgets
-            # check_count_down ≈ budget_max and the countdown never reaches 0 in time.
-            if state["in_think"]:
-                remaining_budget = max(
-                    0, state["thinking_token_budget_max"] - state["think_count"],
-                )
-                term_len = len(state["termination_token_ids"])
-                state["check_count_down"] = max(1, remaining_budget - term_len)
-            else:
-                state["check_count_down"] = state["thinking_token_budget_max"]
-
-            # Check if need to transition to end mode
+            # Check if we need to transition to end mode first, before setting the
+            # countdown. This ensures that if think_count crossed budget_max in this
+            # batch (e.g. a multi-token batch overshoots), in_end flips immediately
+            # rather than waiting one more countdown cycle (which may never come).
             if (
                 state["in_think"]
                 and state["think_count"] >= state["thinking_token_budget_max"]
@@ -270,6 +273,31 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 state["in_think"] = False
                 state["in_end"] = True
                 state["end_count"] = 0
+                state["check_count_down"] = state["thinking_token_budget_max"]
+                print(
+                    f"[ThinkingBudget] in_end=True: think_count={state['think_count']}, "
+                    f"budget=[{state['thinking_token_budget_min']}, {state['thinking_token_budget_max']}], "
+                    f"output_len={len(state.get('output_tok_ids', []))}",
+                    flush=True, file=sys.stderr
+                )
+
+            # Set countdown based on current state.
+            # Cap at (remaining - termination_len) so the termination sequence can always
+            # be forced before max_gen_toks is exhausted. Also hard-cap at 256 so
+            # think_count stays current at high budgets where remaining is large.
+            if state["in_think"]:
+                remaining_budget = max(
+                    0, state["thinking_token_budget_max"] - state["think_count"],
+                )
+                term_len = len(state["termination_token_ids"])
+                state["check_count_down"] = min(max(1, remaining_budget - term_len), 256)
+                print(
+                    f"[ThinkingBudget] countdown set: think_count={state['think_count']}, "
+                    f"remaining={remaining_budget}, term_len={term_len}, "
+                    f"check_count_down={state['check_count_down']}",
+                    flush=True, file=sys.stderr
+                )
+            elif not state["in_end"]:
                 state["check_count_down"] = state["thinking_token_budget_max"]
         # Note: in_end mode advancement (end_count, in_end -> False) is handled in apply(),
         # not here, to avoid the off-by-one where end_count increments before apply() reads it.
@@ -300,6 +328,17 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     self._state.pop(index, None)
 
             for index in batch_update.removed:
+                state = self._state.get(index)
+                if state:
+                    total_toks = len(state.get("output_tok_ids", []))
+                    print(
+                        f"[ThinkingBudget] Request index={index} finished: "
+                        f"total_output_tokens={total_toks}, "
+                        f"think_count={state.get('think_count')}, "
+                        f"budget=[{state.get('thinking_token_budget_min')}, {state.get('thinking_token_budget_max')}], "
+                        f"in_think={state.get('in_think')}, in_end={state.get('in_end')}",
+                        flush=True, file=sys.stderr
+                    )
                 self._state.pop(index, {})
 
             for i1, i2, direction in batch_update.moved:
@@ -346,9 +385,14 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     row_state['in_think'] = False
                     row_state['think_count'] = 0
                     row_state['check_count_down'] = row_state['thinking_token_budget_max']
+                    total_toks = len(row_state['output_tok_ids'])
+                    bmin = row_state['thinking_token_budget_min']
+                    bmax = row_state['thinking_token_budget_max']
+                    in_budget = bmin <= total_toks <= bmax
                     print(
                         f"[ThinkingBudget] Request index={i}: termination sequence complete, "
-                        f"output_tok_ids length={len(row_state['output_tok_ids'])}",
+                        f"total_output_tokens={total_toks}, "
+                        f"budget=[{bmin}, {bmax}], in_budget={in_budget}",
                         flush=True, file=sys.stderr
                     )
 
@@ -1368,12 +1412,13 @@ class VLLM(TemplateLM):
                 generated_text: str = output.outputs[0].text
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
 
-                # Note: think_end_token stripping is intentionally skipped here so that
-                # thinking traces are preserved in the logged samples (resps field).
-                # Filters (e.g. regex) in the task config extract the final answer from
-                # filtered_resps, so scoring is unaffected.
+                # set think_end_token=self.think_end_token to cut out reasoning traces from samples
+                # set think_end_token=None to leave reasoning traces in
+                # If reasoning traces aren't removed, the answer extraction will check the
+                # full trace including reasoning, likely leading to accuracy being lower than expected
+                # Only set think_end_token=None if you're debugging reasoning traces
                 generated_text = postprocess_generated_text(
-                    generated_text, until, think_end_token=None
+                    generated_text, until, think_end_token=self.think_end_token  # None
                 )
                 res.append(generated_text)
                 self.cache_hook.add_partial(
