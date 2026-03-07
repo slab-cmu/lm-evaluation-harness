@@ -489,10 +489,12 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         )
         self._tokenizer = tokenizer
 
-        # Pre-tokenize </think> and <tool_call> for thinking detection.
-        # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary.
+        # Pre-tokenize </think>, <tool_call>, and </tool_response> for thinking detection.
+        # Qwen3 sometimes uses <tool_call>...<tool_response>...</tool_response> as an
+        # alternative think-exit boundary (from its tool-use training distribution).
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
         self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
+        self.tool_response_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</tool_response>"))
 
         # Pre-compute EOS token IDs for use at terminal trie nodes
         eos_ids = []
@@ -568,18 +570,28 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             return
 
         state["prev_output_length"] = current_length
-        # Look back far enough to catch either boundary sequence spanning windows.
-        max_boundary_len = max(len(self.think_end_token_ids), len(self.tool_call_token_ids)) if self.tool_call_token_ids else len(self.think_end_token_ids)
+        # Look back far enough to catch any boundary sequence spanning windows.
+        all_boundary_seqs = [self.think_end_token_ids, self.tool_call_token_ids, self.tool_response_end_token_ids]
+        max_boundary_len = max(len(s) for s in all_boundary_seqs if s)
         check_start = max(0, prev - max_boundary_len)
         # Exclude the trailing sentinel when scanning
         recent = [t for t in output[check_start:] if t >= 0]
 
-        found_boundary = _find_sequence_index(recent, self.think_end_token_ids) >= 0
-        boundary_token = "</think>"
-        if not found_boundary and self.tool_call_token_ids:
-            if _find_sequence_index(recent, self.tool_call_token_ids) >= 0:
-                found_boundary = True
-                boundary_token = "<tool_call>"
+        # Activate on any think-exit boundary: </think>, <tool_call>, or </tool_response>.
+        # Qwen3 uses all three interchangeably as signals that thinking is done.
+        # Whichever appears first triggers activation; subsequent scans are skipped
+        # because update_state() only calls this when constrained_active is False.
+        found_boundary = False
+        boundary_token = None
+        if _find_sequence_index(recent, self.think_end_token_ids) >= 0:
+            found_boundary = True
+            boundary_token = "</think>"
+        elif self.tool_call_token_ids and _find_sequence_index(recent, self.tool_call_token_ids) >= 0:
+            found_boundary = True
+            boundary_token = "<tool_call>"
+        elif self.tool_response_end_token_ids and _find_sequence_index(recent, self.tool_response_end_token_ids) >= 0:
+            found_boundary = True
+            boundary_token = "</tool_response>"
 
         if found_boundary:
             state["constrained_active"] = True
@@ -845,7 +857,7 @@ class VLLM(TemplateLM):
         chat_template_args: Optional[dict] = None,
         # End marker for thinking tags - splits to get response after this token (if provided).
         think_start_token: Optional[str] = None,
-        think_end_token: Optional[str] = None,
+        think_end_token: Optional[Union[str, List[str]]] = None,
         answer_prefix: Optional[str] = None,
         max_think_tokens: Optional[int] = None,
         min_think_tokens: Optional[int] = None,

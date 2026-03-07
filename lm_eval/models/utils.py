@@ -855,7 +855,7 @@ def truncate_tokens(
 
 
 def postprocess_generated_text(
-    generation: str, stop: Union[list[str], str, None], think_end_token: Optional[str]
+    generation: str, stop: Union[list[str], str, None], think_end_token: Union[str, list[str], None]
 ) -> str:
     """
     Post-processes the generated text by stripping stop sequences and optional thinking markers.
@@ -864,8 +864,9 @@ def postprocess_generated_text(
         generation (str): The generated text to be processed.
         stop (Optional[list[str]]): Stop sequence(s) to remove. Text is truncated
             at the first occurrence of any stop sequence.
-        think_end_token (Optional[str]): Token marking end of thinking section. If provided,
-            returns only the text after this token (discarding thinking content).
+        think_end_token (Optional[str | list[str]]): Token(s) marking end of thinking section.
+            If provided, returns only the text after the last occurrence of any of these tokens
+            (discarding thinking content). Accepts a single string or a list of strings.
 
     Returns:
         str: The processed generation - text before stop sequences and after thinking sections.
@@ -878,6 +879,16 @@ def postprocess_generated_text(
                 # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
                 generation = generation.split(term)[0]
     if think_end_token:
-        generation = generation.split(think_end_token)[-1].lstrip()
+        tokens = [think_end_token] if isinstance(think_end_token, str) else think_end_token
+        # Find the latest-occurring end token and split there
+        best_idx = -1
+        best_token_len = 0
+        for token in tokens:
+            idx = generation.rfind(token)
+            if idx != -1 and (idx > best_idx or (idx == best_idx and len(token) > best_token_len)):
+                best_idx = idx
+                best_token_len = len(token)
+        if best_idx != -1:
+            generation = generation[best_idx + best_token_len:].lstrip()
 
     return generation
