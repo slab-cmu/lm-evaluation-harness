@@ -38,10 +38,17 @@ try:
     from vllm.config.model import ModelConfig
     from vllm.config.utils import config
     from vllm.lora.request import LoRARequest
-    from vllm.transformers_utils.tokenizer import get_tokenizer, init_tokenizer_from_configs
+
     try:
+        # Moved since vllm-project/vllm#29793
+        from vllm.tokenizers import get_tokenizer  # type: ignore
+    except ModuleNotFoundError:
+        from vllm.transformers_utils.tokenizer import get_tokenizer
+
+    try:
+        # Moved since vllm-project/vllm#27164
         from vllm.utils.network_utils import get_open_port  # type: ignore
-    except (ModuleNotFoundError, ImportError):
+    except ModuleNotFoundError:
         from vllm.utils import get_open_port
     from vllm.v1.sample.logits_processor.interface import (
         BatchUpdate,
