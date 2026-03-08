@@ -386,7 +386,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             if row_state and (
                 (row_state["in_continuation"] == True and row_state['continuation_count'] < len(self.think_continuation_token_ids)
             ) or (
-                torch.argmax(logits) == self.think_end_token_ids[0]
+                torch.argmax(logits[i]) == self.think_end_token_ids[0]
                 and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']
             )):
                 row_state["in_continuation"] = True
@@ -437,11 +437,13 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 row_state["continuation_mode"] == "wait"
                 and row_state['continuation_count'] >= len(self.think_continuation_token_ids)
             ):
+                remaining = max(0, row_state["thinking_token_budget_max"] - row_state['think_count'])
+                term_len = len(row_state["termination_token_ids"])
                 row_state.update(
                     {
                         "in_continuation": False,
                         "continuation_count": 0,
-                        "check_count_down": row_state["thinking_token_budget_max"] - row_state['think_count'],
+                        "check_count_down": min(max(1, remaining - term_len), 256),
                     }
                 )
 
