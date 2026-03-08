@@ -93,6 +93,11 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary (from its
         # tool-use training distribution). Suppress it under min budget alongside </think>.
         self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
+        print(
+            f"[ThinkingBudget] init: think_end_token_ids={self.think_end_token_ids}, "
+            f"tool_call_token_ids={self.tool_call_token_ids}",
+            flush=True, file=sys.stderr
+        )
         self.think_termination_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(
             # self.tokenizer.tokenize("</think>\n\n The answer is:")
             # TODO: This could be intercepted with prefill rather than decoding, but we'll do drop in replacement for now for performance scaling.
@@ -255,20 +260,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 # Continue thinking mode, increment count by new tokens
                 state["think_count"] += len(new_tokens)
 
-            # Set countdown based on current state.
-            # Cap at (remaining - termination_len) so the termination sequence can always
-            # be forced before max_gen_toks is exhausted. Without this, at high budgets
-            # check_count_down ≈ budget_max and the countdown never reaches 0 in time.
-            if state["in_think"]:
-                remaining_budget = max(
-                    0, state["thinking_token_budget_max"] - state["think_count"],
-                )
-                term_len = len(state["termination_token_ids"])
-                state["check_count_down"] = max(1, remaining_budget - term_len)
-            else:
-                state["check_count_down"] = state["thinking_token_budget_max"]
-
-            # Check if need to transition to end mode
+            # Check if we need to transition to end mode first, before setting the
+            # countdown. This ensures that if think_count crossed budget_max in this
+            # batch (e.g. a multi-token batch overshoots), in_end flips immediately
+            # rather than waiting one more countdown cycle (which may never come).
             if (
                 state["in_think"]
                 and state["think_count"] >= state["thinking_token_budget_max"]
@@ -277,6 +272,25 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 state["in_think"] = False
                 state["in_end"] = True
                 state["end_count"] = 0
+                state["check_count_down"] = state["thinking_token_budget_max"]
+                print(
+                    f"[ThinkingBudget] in_end=True: think_count={state['think_count']}, "
+                    f"budget=[{state['thinking_token_budget_min']}, {state['thinking_token_budget_max']}], "
+                    f"output_len={len(state.get('output_tok_ids', []))}",
+                    flush=True, file=sys.stderr
+                )
+
+            # Set countdown based on current state.
+            # Cap at (remaining - termination_len) so the termination sequence can always
+            # be forced before max_gen_toks is exhausted. Also hard-cap at 256 so
+            # think_count stays current at high budgets where remaining is large.
+            if state["in_think"]:
+                remaining_budget = max(
+                    0, state["thinking_token_budget_max"] - state["think_count"],
+                )
+                term_len = len(state["termination_token_ids"])
+                state["check_count_down"] = min(max(1, remaining_budget - term_len), 256)
+            elif not state["in_end"]:
                 state["check_count_down"] = state["thinking_token_budget_max"]
         # Note: in_end mode advancement (end_count, in_end -> False) is handled in apply(),
         # not here, to avoid the off-by-one where end_count increments before apply() reads it.
@@ -307,6 +321,17 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     self._state.pop(index, None)
 
             for index in batch_update.removed:
+                state = self._state.get(index)
+                if state:
+                    total_toks = len(state.get("output_tok_ids", []))
+                    print(
+                        f"[ThinkingBudget] Request index={index} finished: "
+                        f"total_output_tokens={total_toks}, "
+                        f"think_count={state.get('think_count')}, "
+                        f"budget=[{state.get('thinking_token_budget_min')}, {state.get('thinking_token_budget_max')}], "
+                        f"in_think={state.get('in_think')}, in_end={state.get('in_end')}",
+                        flush=True, file=sys.stderr
+                    )
                 self._state.pop(index, {})
 
             for i1, i2, direction in batch_update.moved:
@@ -353,9 +378,14 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     row_state['in_think'] = False
                     row_state['think_count'] = 0
                     row_state['check_count_down'] = row_state['thinking_token_budget_max']
+                    total_toks = len(row_state['output_tok_ids'])
+                    bmin = row_state['thinking_token_budget_min']
+                    bmax = row_state['thinking_token_budget_max']
+                    in_budget = bmin <= total_toks <= bmax
                     print(
                         f"[ThinkingBudget] Request index={i}: termination sequence complete, "
-                        f"output_tok_ids length={len(row_state['output_tok_ids'])}",
+                        f"total_output_tokens={total_toks}, "
+                        f"budget=[{bmin}, {bmax}], in_budget={in_budget}",
                         flush=True, file=sys.stderr
                     )
 
@@ -363,7 +393,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             if row_state and (
                 (row_state["in_continuation"] == True and row_state['continuation_count'] < len(self.think_continuation_token_ids)
             ) or (
-                torch.argmax(logits) == self.think_end_token_ids[0]
+                torch.argmax(logits[i]) == self.think_end_token_ids[0]
                 and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']
             )):
                 row_state["in_continuation"] = True
@@ -414,11 +444,13 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 row_state["continuation_mode"] == "wait"
                 and row_state['continuation_count'] >= len(self.think_continuation_token_ids)
             ):
+                remaining = max(0, row_state["thinking_token_budget_max"] - row_state['think_count'])
+                term_len = len(row_state["termination_token_ids"])
                 row_state.update(
                     {
                         "in_continuation": False,
                         "continuation_count": 0,
-                        "check_count_down": row_state["thinking_token_budget_max"] - row_state['think_count'],
+                        "check_count_down": min(max(1, remaining - term_len), 256),
                     }
                 )
 
@@ -466,10 +498,13 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         )
         self._tokenizer = tokenizer
 
-        # Pre-tokenize </think> and <tool_call> for thinking detection.
-        # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary.
+        # Pre-tokenize all think-exit boundary tokens for thinking detection.
+        # Qwen3 (without real tool use) may emit any of these as an alternative to </think>.
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
         self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
+        self.tool_call_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</tool_call>"))
+        self.tool_response_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_response>"))
+        self.tool_response_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</tool_response>"))
 
         # Pre-compute EOS token IDs for use at terminal trie nodes
         eos_ids = []
@@ -545,18 +580,35 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             return
 
         state["prev_output_length"] = current_length
-        # Look back far enough to catch either boundary sequence spanning windows.
-        max_boundary_len = max(len(self.think_end_token_ids), len(self.tool_call_token_ids)) if self.tool_call_token_ids else len(self.think_end_token_ids)
+        # Scan from (prev - max_boundary_len) to catch sequences that span scan windows,
+        # but always include all newly committed tokens since last scan (from prev onward).
+        all_boundary_seqs = [
+            self.think_end_token_ids, self.tool_call_token_ids, self.tool_call_end_token_ids,
+            self.tool_response_token_ids, self.tool_response_end_token_ids,
+        ]
+        max_boundary_len = max(len(s) for s in all_boundary_seqs if s)
         check_start = max(0, prev - max_boundary_len)
         # Exclude the trailing sentinel when scanning
         recent = [t for t in output[check_start:] if t >= 0]
 
-        found_boundary = _find_sequence_index(recent, self.think_end_token_ids) >= 0
-        boundary_token = "</think>"
-        if not found_boundary and self.tool_call_token_ids:
-            if _find_sequence_index(recent, self.tool_call_token_ids) >= 0:
+        # Activate on any think-exit boundary token.
+        # Qwen3 (without real tool use) may emit any of these as signals that thinking is done.
+        # Whichever appears first triggers activation; subsequent scans are skipped
+        # because update_state() only calls this when constrained_active is False.
+        boundary_seqs = [
+            (self.think_end_token_ids, "</think>"),
+            (self.tool_call_token_ids, "<tool_call>"),
+            (self.tool_call_end_token_ids, "</tool_call>"),
+            (self.tool_response_token_ids, "<tool_response>"),
+            (self.tool_response_end_token_ids, "</tool_response>"),
+        ]
+        found_boundary = False
+        boundary_token = None
+        for token_ids, name in boundary_seqs:
+            if token_ids and _find_sequence_index(recent, token_ids) >= 0:
                 found_boundary = True
-                boundary_token = "<tool_call>"
+                boundary_token = name
+                break
 
         if found_boundary:
             state["constrained_active"] = True
@@ -822,7 +874,7 @@ class VLLM(TemplateLM):
         chat_template_args: Optional[dict] = None,
         # End marker for thinking tags - splits to get response after this token (if provided).
         think_start_token: Optional[str] = None,
-        think_end_token: Optional[str] = None,
+        think_end_token: Optional[Union[str, List[str]]] = None,
         answer_prefix: Optional[str] = None,
         max_think_tokens: Optional[int] = None,
         min_think_tokens: Optional[int] = None,
@@ -1375,12 +1427,13 @@ class VLLM(TemplateLM):
                 generated_text: str = output.outputs[0].text
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
 
-                # Note: think_end_token stripping is intentionally skipped here so that
-                # thinking traces are preserved in the logged samples (resps field).
-                # Filters (e.g. regex) in the task config extract the final answer from
-                # filtered_resps, so scoring is unaffected.
+                # set think_end_token=self.think_end_token to cut out reasoning traces from samples
+                # set think_end_token=None to leave reasoning traces in
+                # If reasoning traces aren't removed, the answer extraction will check the
+                # full trace including reasoning, likely leading to accuracy being lower than expected
+                # Only set think_end_token=None if you're debugging reasoning traces
                 generated_text = postprocess_generated_text(
-                    generated_text, until, think_end_token=None
+                    generated_text, until, think_end_token=self.think_end_token  # None
                 )
                 res.append(generated_text)
                 self.cache_hook.add_partial(
