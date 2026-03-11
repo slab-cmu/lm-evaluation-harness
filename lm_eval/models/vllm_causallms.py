@@ -614,9 +614,10 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             state["constrained_active"] = True
             state["current_node"] = state["trie_root"]
             state["next_read_idx"] = len(output)  # start consuming from here, after boundary
+            state["_constrained_start_idx"] = len(output)
             print(
-                f"[ConstrainedDecoding] {boundary_token} detected at output token {current_length}. "
-                f"Constrained decoding now active.",
+                f"[ConstrainedDecoding] {boundary_token} detected at output token {current_length}, "
+                f"next_read_idx={len(output)}. Constrained decoding now active.",
                 flush=True, file=sys.stderr
             )
 
@@ -701,6 +702,15 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         for i in range(batch_size):
             state = self._state.get(i)
             if not state or not state["active"] or not state["constrained_active"]:
+                if state and state.get("active") and not state.get("constrained_active"):
+                    output = state.get("output_tok_ids", [])
+                    if len(output) > state.get("_last_skipped_log_len", 0) + 256:
+                        state["_last_skipped_log_len"] = len(output)
+                        print(
+                            f"[ConstrainedDecoding] row={i} active but constrained_active=False "
+                            f"at output_len={len(output)}, enable_thinking={state.get('enable_thinking')}",
+                            flush=True, file=sys.stderr
+                        )
                 continue
 
             # Advance trie by consuming all newly committed tokens since last apply().
@@ -719,17 +729,18 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                         state["next_read_idx"] += 1
                         if state["current_node"].is_terminal:
                             state["completed"] = True
+                            start = state.get("_constrained_start_idx", 0)
                             print(
-                                f"[ConstrainedDecoding] Request completed trie traversal. "
-                                f"Answer decoded: {repr(self._tokenizer.decode(output[:state['next_read_idx']]))}",
+                                f"[ConstrainedDecoding] row={i} completed trie traversal at output_len={len(output)}. "
+                                f"Answer decoded: {repr(self._tokenizer.decode(output[start:state['next_read_idx']]))}",
                                 flush=True, file=sys.stderr
                             )
                             break
                     else:
                         print(
-                            f"[ConstrainedDecoding] WARNING: committed token {tok} "
+                            f"[ConstrainedDecoding] WARNING: row={i} committed token {tok} "
                             f"({repr(self._tokenizer.decode([tok]))}) not in trie at depth {state['next_read_idx']}. "
-                            f"Valid: {list(node.children.keys())}. Forcing EOS.",
+                            f"Valid first tokens: {[repr(self._tokenizer.decode([t])) for t in list(node.children.keys())[:8]]}. Forcing EOS.",
                             flush=True, file=sys.stderr
                         )
                         state["completed"] = True
