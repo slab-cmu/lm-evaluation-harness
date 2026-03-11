@@ -65,6 +65,14 @@ if TYPE_CHECKING:
     pass
 
 eval_logger = logging.getLogger(__name__)
+
+# Maximum number of tokens to skip between think_count updates in ThinkingTokenBudgetLogitsProcessor.
+# Lower values mean the budget fires more precisely but add slight overhead per step.
+# Must be well below the max_gen_toks headroom (budget_max + 256) minus the termination
+# sequence length (~25 tokens), so the termination sequence always fits before max_gen_toks.
+# At 64, worst-case overshoot is 64 tokens: 64 + 25 = 89 << 256 headroom.
+THINKING_BUDGET_COUNTDOWN_CAP = 64
+
 # Candidate Continuation Behavior:
 #   1. Sample Next Most Likely Token
 #   2. Sample: "Wait" Token
@@ -87,6 +95,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             # add_bos_token=vllm_config.add_bos_token,
         )
 
+        self._tokenizer = tokenizer
         self.think_start_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<think>"))
         self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("Let's verify this solution"))
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
@@ -113,7 +122,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         # "in_think": bool - currently in thinking mode
         # "in_end": bool - currently forcing end tokens output
         # "check_count_down": int - steps remaining until next think
-        #                            start/end token parsing
+        #                            start/end token parsing (capped at THINKING_BUDGET_COUNTDOWN_CAP)
         # "think_count": int - number of thinking tokens generated
         # "end_count": int - number of end tokens forced so far
         # "thinking_token_budget": int - max allowed thinking tokens
@@ -282,14 +291,14 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
             # Set countdown based on current state.
             # Cap at (remaining - termination_len) so the termination sequence can always
-            # be forced before max_gen_toks is exhausted. Also hard-cap at 256 so
-            # think_count stays current at high budgets where remaining is large.
+            # be forced before max_gen_toks is exhausted. Also hard-cap at
+            # THINKING_BUDGET_COUNTDOWN_CAP so think_count stays current at high budgets.
             if state["in_think"]:
                 remaining_budget = max(
                     0, state["thinking_token_budget_max"] - state["think_count"],
                 )
                 term_len = len(state["termination_token_ids"])
-                state["check_count_down"] = min(max(1, remaining_budget - term_len), 256)
+                state["check_count_down"] = min(max(1, remaining_budget - term_len), THINKING_BUDGET_COUNTDOWN_CAP)
             elif not state["in_end"]:
                 state["check_count_down"] = state["thinking_token_budget_max"]
         # Note: in_end mode advancement (end_count, in_end -> False) is handled in apply(),
@@ -323,13 +332,20 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             for index in batch_update.removed:
                 state = self._state.get(index)
                 if state:
-                    total_toks = len(state.get("output_tok_ids", []))
+                    output_tok_ids = state.get("output_tok_ids", [])
+                    total_toks = len(output_tok_ids)
+                    tail_ids = [t for t in output_tok_ids[-50:] if t >= 0]
+                    try:
+                        tail_text = self._tokenizer.decode(tail_ids)
+                    except Exception:
+                        tail_text = repr(tail_ids)
                     print(
                         f"[ThinkingBudget] Request index={index} finished: "
                         f"total_output_tokens={total_toks}, "
                         f"think_count={state.get('think_count')}, "
                         f"budget=[{state.get('thinking_token_budget_min')}, {state.get('thinking_token_budget_max')}], "
-                        f"in_think={state.get('in_think')}, in_end={state.get('in_end')}",
+                        f"in_think={state.get('in_think')}, in_end={state.get('in_end')}, "
+                        f"tail={repr(tail_text)}",
                         flush=True, file=sys.stderr
                     )
                 self._state.pop(index, {})
@@ -450,7 +466,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     {
                         "in_continuation": False,
                         "continuation_count": 0,
-                        "check_count_down": min(max(1, remaining - term_len), 256),
+                        "check_count_down": min(max(1, remaining - term_len), THINKING_BUDGET_COUNTDOWN_CAP),
                     }
                 )
 
