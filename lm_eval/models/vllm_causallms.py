@@ -433,6 +433,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 if self.tool_call_token_ids:
                     logits[i, self.tool_call_token_ids[0]] = -1e9
 
+            # Suppress <think> while already in_think to prevent the model from generating
+            # <think> as literal content inside its reasoning, which would reset think_count
+            # and prevent the budget trigger from ever firing.
+            if row_state and row_state.get('in_think') and self.think_start_token_ids:
+                logits[i, self.think_start_token_ids[0]] = -1e9
+
             # After termination sequence has been forced, suppress <think> to prevent
             # the model from re-entering a thinking block in its answer section.
             if row_state and row_state.get('terminated') and self.think_start_token_ids:
