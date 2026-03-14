@@ -185,6 +185,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             "in_think": in_think,  # Currently in thinking mode
             "in_end": in_think and thinking_token_budget_max == 0,
             "in_continuation": False,
+            "terminated": False,  # True after termination sequence has been fully forced
             "check_count_down": 1, # thinking_token_budget_max,
             "think_count": think_count,  # Number of tokens in thinking section
             "end_count": 0,  # Number of end tokens forced so far
@@ -290,9 +291,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 )
 
             # Set countdown based on current state.
-            # Cap at (remaining - termination_len) so the termination sequence can always
-            # be forced before max_gen_toks is exhausted. Also hard-cap at
-            # THINKING_BUDGET_COUNTDOWN_CAP so think_count stays current at high budgets.
+            # While thinking: dynamically track remaining budget so we scan just before
+            # budget_max is hit (Jared's original design). Cap at THINKING_BUDGET_COUNTDOWN_CAP
+            # to stay responsive even at large budgets, and subtract term_len so we never
+            # overshoot max_gen_toks before the termination sequence can be forced.
+            # Outside think mode (answer phase or post-termination): use a small constant so
+            # we stay responsive to re-entry detection without burning cycles.
             if state["in_think"]:
                 remaining_budget = max(
                     0, state["thinking_token_budget_max"] - state["think_count"],
@@ -300,7 +304,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 term_len = len(state["termination_token_ids"])
                 state["check_count_down"] = min(max(1, remaining_budget - term_len), THINKING_BUDGET_COUNTDOWN_CAP)
             elif not state["in_end"]:
-                state["check_count_down"] = state["thinking_token_budget_max"]
+                state["check_count_down"] = THINKING_BUDGET_COUNTDOWN_CAP
         # Note: in_end mode advancement (end_count, in_end -> False) is handled in apply(),
         # not here, to avoid the off-by-one where end_count increments before apply() reads it.
 
@@ -393,7 +397,8 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     row_state['end_count'] = 0
                     row_state['in_think'] = False
                     row_state['think_count'] = 0
-                    row_state['check_count_down'] = row_state['thinking_token_budget_max']
+                    row_state['terminated'] = True
+                    row_state['check_count_down'] = THINKING_BUDGET_COUNTDOWN_CAP
                     total_toks = len(row_state['output_tok_ids'])
                     bmin = row_state['thinking_token_budget_min']
                     bmax = row_state['thinking_token_budget_max']
@@ -427,6 +432,11 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 logits[i, self.think_end_token_ids[0]] = -1e9
                 if self.tool_call_token_ids:
                     logits[i, self.tool_call_token_ids[0]] = -1e9
+
+            # After termination sequence has been forced, suppress <think> to prevent
+            # the model from re-entering a thinking block in its answer section.
+            if row_state and row_state.get('terminated') and self.think_start_token_ids:
+                logits[i, self.think_start_token_ids[0]] = -1e9
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
