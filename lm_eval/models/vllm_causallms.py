@@ -102,9 +102,23 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary (from its
         # tool-use training distribution). Suppress it under min budget alongside </think>.
         self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
+
+        # Pre-compute EOS token IDs to suppress while in_think (prevents early termination
+        # after <think> is suppressed, which can push <|im_end|> to argmax)
+        eos_ids = []
+        for tok in [tokenizer.eos_token_id]:
+            if tok is not None:
+                eos_ids.append(tok)
+        for tok_str in ["<|im_end|>", "<|eot_id|>"]:
+            tid = tokenizer.convert_tokens_to_ids(tok_str)
+            if tid is not None and tid != tokenizer.unk_token_id and tid not in eos_ids:
+                eos_ids.append(tid)
+        self.eos_token_ids = eos_ids
+
         print(
             f"[ThinkingBudget] init: think_end_token_ids={self.think_end_token_ids}, "
-            f"tool_call_token_ids={self.tool_call_token_ids}",
+            f"tool_call_token_ids={self.tool_call_token_ids}, "
+            f"eos_token_ids={self.eos_token_ids}",
             flush=True, file=sys.stderr
         )
         self.think_termination_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(
@@ -438,6 +452,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             # and prevent the budget trigger from ever firing.
             if row_state and row_state.get('in_think') and self.think_start_token_ids:
                 logits[i, self.think_start_token_ids[0]] = -1e9
+
+            # Suppress EOS / <|im_end|> while in_think. After <think> is suppressed, EOS
+            # can become the argmax and terminate the sequence before the budget is reached.
+            if row_state and row_state.get('in_think') and self.eos_token_ids:
+                for eos_id in self.eos_token_ids:
+                    logits[i, eos_id] = -1e9
 
             # After termination sequence has been forced, suppress <think> to prevent
             # the model from re-entering a thinking block in its answer section.
