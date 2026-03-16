@@ -97,7 +97,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         self._tokenizer = tokenizer
         self.think_start_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<think>"))
-        self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("Let's verify this solution"))
+        self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("I need to continue reasoning. I cannot exit the thinking section yet as I haven't reached the required token budget."))
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
         # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary (from its
         # tool-use training distribution). Suppress it under min budget alongside </think>.
@@ -109,7 +109,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         for tok in [tokenizer.eos_token_id]:
             if tok is not None:
                 eos_ids.append(tok)
-        for tok_str in ["<|im_end|>", "<|eot_id|>"]:
+        for tok_str in ["<|im_end|>", "<|eot_id|>", "<|endoftext|>", "</s>"]:
             tid = tokenizer.convert_tokens_to_ids(tok_str)
             if tid is not None and tid != tokenizer.unk_token_id and tid not in eos_ids:
                 eos_ids.append(tid)
@@ -337,15 +337,22 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 thinking_token_budget_min = params.extra_args.get('thinking_token_budget_min', None)
                 answer_prefix_ids = params.extra_args.get('answer_prefix_ids', None)
                 continuation_mode = params.extra_args.get("continuation_mode", "wait")
+                doc_id = params.extra_args.get("doc_id", None)
 
                 if thinking_token_budget_max is not None or thinking_token_budget_min is not None:
                     self._state[index] = self._init_state_entry(
                         prompt_tok_ids, thinking_token_budget_max, thinking_token_budget_min, answer_prefix_ids, continuation_mode
                     )
                     self._state[index]["output_tok_ids"] = output_tok_ids
+                    self._state[index]["doc_id"] = doc_id
                 else:
                     # Remove state if no thinking budget
                     self._state.pop(index, None)
+                    print(
+                        f"[ThinkingBudget] WARNING: Request index={index} added with no budget keys "
+                        f"(extra_args={params.extra_args})",
+                        flush=True, file=sys.stderr
+                    )
 
             for index in batch_update.removed:
                 state = self._state.get(index)
@@ -358,12 +365,18 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     except Exception:
                         tail_text = repr(tail_ids)
                     print(
-                        f"[ThinkingBudget] Request index={index} finished: "
+                        f"[ThinkingBudget] doc_id={state.get('doc_id')} finished: "
                         f"total_output_tokens={total_toks}, "
                         f"think_count={state.get('think_count')}, "
                         f"budget=[{state.get('thinking_token_budget_min')}, {state.get('thinking_token_budget_max')}], "
                         f"in_think={state.get('in_think')}, in_end={state.get('in_end')}, "
                         f"tail={repr(tail_text)}",
+                        flush=True, file=sys.stderr
+                    )
+                else:
+                    print(
+                        f"[ThinkingBudget] WARNING: Request index={index} removed with no state "
+                        f"(thinking budget was not set for this request)",
                         flush=True, file=sys.stderr
                     )
                 self._state.pop(index, {})
@@ -399,7 +412,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 # apply() reads end_count.
                 if row_state['end_count'] == 0:
                     print(
-                        f"[ThinkingBudget] Request index={i}: forcing termination sequence "
+                        f"[ThinkingBudget] doc_id={row_state.get('doc_id')}: forcing termination sequence "
                         f"({len(termination_token_ids)} tokens), "
                         f"think_count={row_state['think_count']}, "
                         f"budget=[{row_state['thinking_token_budget_min']}, {row_state['thinking_token_budget_max']}]",
@@ -418,46 +431,40 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     bmax = row_state['thinking_token_budget_max']
                     in_budget = bmin <= total_toks <= bmax
                     print(
-                        f"[ThinkingBudget] Request index={i}: termination sequence complete, "
+                        f"[ThinkingBudget] doc_id={row_state.get('doc_id')}: termination sequence complete, "
                         f"total_output_tokens={total_toks}, "
                         f"budget=[{bmin}, {bmax}], in_budget={in_budget}",
                         flush=True, file=sys.stderr
                     )
 
-            # Either begin continuation sequence if </think> is present; or if already in continuation
-            if row_state and (
-                (row_state["in_continuation"] == True and row_state['continuation_count'] < len(self.think_continuation_token_ids)
-            ) or (
-                torch.argmax(logits[i]) == self.think_end_token_ids[0]
+            under_min_budget = (
+                row_state is not None
                 and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']
-            )):
-                row_state["in_continuation"] = True
-                self.mask[i] = True
-                if (
-                    row_state["continuation_mode"] == "wait"
-                    and row_state['continuation_count'] < len(self.think_continuation_token_ids)
-                ):
-                    self.force_token_ids[i] = self.think_continuation_token_ids[row_state['continuation_count']]
-
-            # Suppress </think> and <tool_call> if under the required budget.
-            # Qwen3 uses <tool_call> as an alternative think-exit boundary, so we must
-            # suppress it the same way we suppress </think>.
-            if row_state and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']:
-                logits[i, self.think_end_token_ids[0]] = -1e9
-                if self.tool_call_token_ids:
-                    logits[i, self.tool_call_token_ids[0]] = -1e9
-
-            # Suppress <think> while already in_think to prevent the model from generating
-            # <think> as literal content inside its reasoning, which would reset think_count
-            # and prevent the budget trigger from ever firing.
-            if row_state and row_state.get('in_think') and self.think_start_token_ids:
-                logits[i, self.think_start_token_ids[0]] = -1e9
-
-            # Suppress EOS / <|im_end|> while in_think. After <think> is suppressed, EOS
-            # can become the argmax and terminate the sequence before the budget is reached.
-            if row_state and row_state.get('in_think') and self.eos_token_ids:
-                for eos_id in self.eos_token_ids:
-                    logits[i, eos_id] = -1e9
+            )
+            if row_state and under_min_budget:
+                argmax_tok = torch.argmax(logits[i]).item()
+                argmax_is_exit = (
+                    argmax_tok == self.think_end_token_ids[0]
+                    or (self.think_start_token_ids and argmax_tok == self.think_start_token_ids[0])
+                    or argmax_tok in self.eos_token_ids
+                )
+                if row_state["continuation_mode"] == "wait":
+                    # Force continuation sequence when an exit token is argmax, or while
+                    # mid-continuation. The forced token dominates at 1e9 so no suppression needed.
+                    if argmax_is_exit or (row_state["in_continuation"] and row_state['continuation_count'] < len(self.think_continuation_token_ids)):
+                        row_state["in_continuation"] = True
+                        self.mask[i] = True
+                        self.force_token_ids[i] = self.think_continuation_token_ids[row_state['continuation_count']]
+                elif row_state["continuation_mode"] == "suppress_end_think":
+                    # Suppress exit tokens directly; let the model pick next best.
+                    if argmax_is_exit:
+                        logits[i, self.think_end_token_ids[0]] = -1e9
+                        if self.think_start_token_ids:
+                            logits[i, self.think_start_token_ids[0]] = -1e9
+                        for eos_id in self.eos_token_ids:
+                            logits[i, eos_id] = -1e9
+                    if self.tool_call_token_ids:
+                        logits[i, self.tool_call_token_ids[0]] = -1e9
 
             # After termination sequence has been forced, suppress <think> to prevent
             # the model from re-entering a thinking block in its answer section.
@@ -479,23 +486,14 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 force_tokens = self.force_token_ids[active_indices]
                 logits[active_indices, force_tokens] = 1e9
 
-        # Increment the tracker on the continuation sequence or reset if done
+        # Advance or reset the continuation counter for "wait" mode
         for i in range(batch_size):
             row_state = self._state.get(i)
-            if row_state is None:
+            if row_state is None or row_state["continuation_mode"] != "wait":
                 continue
-            if row_state["continuation_mode"] == "suppress_end_think":
-                row_state['in_continuation'] = False
-                row_state['continuation_count'] = 0
-            elif (
-                row_state["continuation_mode"] == "wait" and row_state['in_continuation']
-                and row_state['continuation_count'] < len(self.think_continuation_token_ids)
-            ):
+            if row_state['in_continuation'] and row_state['continuation_count'] < len(self.think_continuation_token_ids):
                 row_state['continuation_count'] += 1
-            elif (
-                row_state["continuation_mode"] == "wait"
-                and row_state['continuation_count'] >= len(self.think_continuation_token_ids)
-            ):
+            elif row_state['continuation_count'] >= len(self.think_continuation_token_ids):
                 remaining = max(0, row_state["thinking_token_budget_max"] - row_state['think_count'])
                 term_len = len(row_state["termination_token_ids"])
                 row_state.update(
@@ -563,7 +561,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         for tok in [tokenizer.eos_token_id]:
             if tok is not None:
                 eos_ids.append(tok)
-        for tok_str in ["<|im_end|>", "<|eot_id|>"]:
+        for tok_str in ["<|im_end|>", "<|eot_id|>", "<|endoftext|>", "</s>"]:
             tid = tokenizer.convert_tokens_to_ids(tok_str)
             if tid is not None and tid != tokenizer.unk_token_id and tid not in eos_ids:
                 eos_ids.append(tid)
@@ -668,7 +666,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
             state["next_read_idx"] = len(output)  # start consuming from here, after boundary
             state["_constrained_start_idx"] = len(output)
             print(
-                f"[ConstrainedDecoding] {boundary_token} detected at output token {current_length}, "
+                f"[ConstrainedDecoding] doc_id={state.get('doc_id')} {boundary_token} detected at output token {current_length}, "
                 f"next_read_idx={len(output)}. Constrained decoding now active.",
                 flush=True, file=sys.stderr
             )
@@ -730,6 +728,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                 "prev_output_length": len(output_tok_ids),
                 "next_read_idx": len(output_tok_ids),  # index of next token to consume from output_tok_ids
                 "completed": False,
+                "doc_id": extra.get("doc_id", None),
             }
 
         for i1, i2, direction in batch_update.moved:
@@ -754,15 +753,6 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         for i in range(batch_size):
             state = self._state.get(i)
             if not state or not state["active"] or not state["constrained_active"]:
-                if state and state.get("active") and not state.get("constrained_active"):
-                    output = state.get("output_tok_ids", [])
-                    if len(output) > state.get("_last_skipped_log_len", 0) + 256:
-                        state["_last_skipped_log_len"] = len(output)
-                        print(
-                            f"[ConstrainedDecoding] row={i} active but constrained_active=False "
-                            f"at output_len={len(output)}, enable_thinking={state.get('enable_thinking')}",
-                            flush=True, file=sys.stderr
-                        )
                 continue
 
             # Advance trie by consuming all newly committed tokens since last apply().
@@ -783,14 +773,14 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                             state["completed"] = True
                             start = state.get("_constrained_start_idx", 0)
                             print(
-                                f"[ConstrainedDecoding] row={i} completed trie traversal at output_len={len(output)}. "
+                                f"[ConstrainedDecoding] doc_id={state.get('doc_id')} completed trie traversal at output_len={len(output)}. "
                                 f"Answer decoded: {repr(self._tokenizer.decode(output[start:state['next_read_idx']]))}",
                                 flush=True, file=sys.stderr
                             )
                             break
                     else:
                         print(
-                            f"[ConstrainedDecoding] WARNING: row={i} committed token {tok} "
+                            f"[ConstrainedDecoding] WARNING: doc_id={state.get('doc_id')} committed token {tok} "
                             f"({repr(self._tokenizer.decode([tok]))}) not in trie at depth {state['next_read_idx']}. "
                             f"Valid first tokens: {[repr(self._tokenizer.decode([t])) for t in list(node.children.keys())[:8]]}. Forcing EOS.",
                             flush=True, file=sys.stderr
@@ -812,7 +802,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                         output = state["output_tok_ids"]
                         next_tok = output[state["next_read_idx"]] if state["next_read_idx"] < len(output) else None
                         print(
-                            f"[ConstrainedDecoding] WARNING: row={i} at trie root with unconsumed tokens. "
+                            f"[ConstrainedDecoding] WARNING: doc_id={state.get('doc_id')} at trie root with unconsumed tokens. "
                             f"next_read_idx={state['next_read_idx']}, len(output)={len(output)}, "
                             f"next_tok={next_tok} ({repr(self._tokenizer.decode([next_tok])) if next_tok is not None and next_tok >= 0 else next_tok}), "
                             f"root_children={list(state['trie_root'].children.keys())[:8]}",
@@ -820,7 +810,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
                         )
                     elif root_steps % 500 == 0:
                         print(
-                            f"[ConstrainedDecoding] WARNING: row={i} still stuck at trie root, "
+                            f"[ConstrainedDecoding] WARNING: doc_id={state.get('doc_id')} still stuck at trie root, "
                             f"{root_steps} steps, next_read_idx={state['next_read_idx']}, "
                             f"len(output)={len(state['output_tok_ids'])}.",
                             flush=True, file=sys.stderr
@@ -1409,11 +1399,12 @@ class VLLM(TemplateLM):
 
         # batch tokenize contexts
         context, all_gen_kwargs = zip(*(req.args for req in requests))
+        doc_ids = [req.doc_id for req in requests]
         context_encoding: List[List[int]] = self.tok_encode(
             context, add_special_tokens=self.add_bos_token
         )
         requests = [
-            ((a, b), c) for a, b, c in zip(context, context_encoding, all_gen_kwargs)
+            ((a, b), c, d) for a, b, c, d in zip(context, context_encoding, all_gen_kwargs, doc_ids)
         ]
 
         def _collate_gen(_requests):
@@ -1442,11 +1433,11 @@ class VLLM(TemplateLM):
         # for each different set of kwargs, we execute all requests, by batch.
         eos = self.tokenizer.decode(self.eot_token_id)
         for chunk in chunks:
-            context_and_encoding, all_gen_kwargs = zip(*chunk)
+            context_and_encoding, all_gen_kwargs, chunk_doc_ids = zip(*chunk)
             context, context_encoding = zip(*context_and_encoding)
             context_encoding_truncated = []
             sampling_params = []
-            for x, gen_kwargs in zip(context_encoding, all_gen_kwargs):
+            for x, gen_kwargs, doc_id in zip(context_encoding, all_gen_kwargs, chunk_doc_ids):
                 # unpack our keyword arguments.
                 if isinstance(gen_kwargs, dict):
                     kwargs = copy.deepcopy(gen_kwargs)  # edge case for repeats > 1
@@ -1473,6 +1464,11 @@ class VLLM(TemplateLM):
                     context_encoding_truncated.append(x)
                 # create sampling params
                 kwargs = self.modify_gen_kwargs(kwargs)
+
+                # Inject doc_id into extra_args so logits processors can log it
+                if "extra_args" not in kwargs or kwargs["extra_args"] is None:
+                    kwargs["extra_args"] = {}
+                kwargs["extra_args"]["doc_id"] = doc_id
 
                 sampling_params.append(
                     SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)
