@@ -1018,9 +1018,6 @@ class VLLM(TemplateLM):
                 f"VLLM.__init__: Stored {len(processors)} processors"
             )
 
-        # Extract eos_tokens before passing kwargs to LLM (not a vLLM arg)
-        self.eos_tokens: List[str] = kwargs.pop("eos_tokens", []) or []
-
         self.model_args.update(kwargs)
         self.batch_size = (
             "auto"
@@ -1446,10 +1443,6 @@ class VLLM(TemplateLM):
                     kwargs = copy.deepcopy(gen_kwargs)  # edge case for repeats > 1
                     # add EOS token to stop sequences
                     until = handle_stop_sequences(kwargs.pop("until", None), eos=eos)
-                    # Merge model-family EOS tokens from model_args.yaml
-                    for tok in self.eos_tokens:
-                        if tok not in until:
-                            until.append(tok)
                 else:
                     raise ValueError(
                         f"Expected `kwargs` to be of type `dict` but got {type(gen_kwargs)}"
