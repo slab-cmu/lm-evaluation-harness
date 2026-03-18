@@ -466,9 +466,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     if self.tool_call_token_ids:
                         logits[i, self.tool_call_token_ids[0]] = -1e9
 
-            # After termination sequence has been forced, suppress <think> to prevent
-            # the model from re-entering a thinking block in its answer section.
-            if row_state and row_state.get('terminated') and self.think_start_token_ids:
+            # Suppress <think> whenever already inside a thinking block (in_think=True)
+            # to prevent nested think tags, and after forced termination to prevent
+            # re-entering a thinking block in the answer section.
+            if row_state and self.think_start_token_ids and (row_state.get('in_think') or row_state.get('terminated')):
                 logits[i, self.think_start_token_ids[0]] = -1e9
 
         # Check in CPU first not to sync with GPU
