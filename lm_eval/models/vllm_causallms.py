@@ -176,11 +176,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             termination_token_ids.extend(answer_prefix_ids)
 
         if prompt_tok_ids is None:
-            last_start = -1
-            last_end = -1
             in_think = False
-            think_count = 0
         else:
+            # Determine whether the prompt ends inside a thinking block by checking
+            # whether the last <think> appears after the last </think>. We only use
+            # </think> to track state transitions — <think> in generated tokens is
+            # ignored to avoid think_count resets from prose references to the token.
             last_start = self._find_last_sequence_index(
                 prompt_tok_ids, self.think_start_token_ids
             )
@@ -188,12 +189,8 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 prompt_tok_ids, self.think_end_token_ids
             )
             in_think = last_start > last_end
-            if in_think:
-                think_count = len(prompt_tok_ids) - (
-                    last_start + len(self.think_start_token_ids)
-                )
-            else:
-                think_count = 0
+        # think_count always starts at 0: we count generated tokens only, not prompt tokens.
+        think_count = 0
 
         return {
             "in_think": in_think,  # Currently in thinking mode
@@ -234,54 +231,26 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         new_tokens = output[prev_length:]
         state["prev_output_length"] = current_length
 
-        # Check if new tokens contain think start or end sequences
-        start_len = len(self.think_start_token_ids)
+        # Only scan for </think> in generated tokens. <think> in generated output is
+        # ignored: the model should not re-open a thinking block, and scanning for it
+        # caused think_count resets when the model referenced <think> in prose.
         end_len = len(self.think_end_token_ids)
-
-        # Look for think sequences in recent tokens (including boundary)
-        # Check overlapping regions where sequences might span boundaries
-        check_start_idx = max(0, prev_length - max(start_len, end_len) + 1)
+        check_start_idx = max(0, prev_length - end_len + 1)
         recent_tokens = output[check_start_idx:]
 
-        # Find any think start/end sequences in recent tokens
-        recent_start_pos = self._find_last_sequence_index(
-            recent_tokens, self.think_start_token_ids
-        )
         recent_end_pos = self._find_last_sequence_index(
             recent_tokens, self.think_end_token_ids
         )
-        # TODO(Jared): Suppress ANY EoS Token until; including eot besides </think>
-        # recent_end_seq_pos = self._find_last_sequence_index(
-        #     recent_tokens
-        # )
 
         # Update state based on recent sequences
         if not state["in_end"]:
-            if recent_start_pos >= 0 and recent_end_pos >= 0:
-                if recent_start_pos > recent_end_pos:
-                    # Case: ...<end>...<start>... - entering think mode
-                    absolute_start_pos = check_start_idx + recent_start_pos
-                    new_think_count = current_length - (absolute_start_pos + start_len)
-                    state["in_think"] = True
-                    state["think_count"] = new_think_count
-                else:
-                    # Case: ...<start>...<end>... - exiting think mode
-                    if state["think_count"] >= state["thinking_token_budget_min"]:
-                        state["in_think"] = False
-                        state["think_count"] = 0
-
-            elif recent_start_pos >= 0:
-                # Found think start - entering think mode
-                absolute_start_pos = check_start_idx + recent_start_pos
-                new_think_count = current_length - (absolute_start_pos + start_len)
-                state["in_think"] = True
-                state["think_count"] = new_think_count
-            elif recent_end_pos >= 0 and state["think_count"]:
-                # Found think end - exiting think mode
-                state["in_think"] = False
-                state["think_count"] = 0
+            if recent_end_pos >= 0 and state["in_think"]:
+                # Found </think> - exiting think mode (only if min budget satisfied)
+                if state["think_count"] >= state["thinking_token_budget_min"]:
+                    state["in_think"] = False
+                    state["think_count"] = 0
             elif state["in_think"]:
-                # Continue thinking mode, increment count by new tokens
+                # Continue thinking: count all new tokens regardless of content
                 state["think_count"] += len(new_tokens)
 
             # Check if we need to transition to end mode first, before setting the
@@ -306,11 +275,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
             # Set countdown based on current state.
             # While thinking: dynamically track remaining budget so we scan just before
-            # budget_max is hit (Jared's original design). Cap at THINKING_BUDGET_COUNTDOWN_CAP
-            # to stay responsive even at large budgets, and subtract term_len so we never
-            # overshoot max_gen_toks before the termination sequence can be forced.
-            # Outside think mode (answer phase or post-termination): use a small constant so
-            # we stay responsive to re-entry detection without burning cycles.
+            # budget_max is hit
             if state["in_think"]:
                 remaining_budget = max(
                     0, state["thinking_token_budget_max"] - state["think_count"],
@@ -439,13 +404,13 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
             under_min_budget = (
                 row_state is not None
-                and len(row_state['output_tok_ids']) < row_state['thinking_token_budget_min']
+                and row_state['think_count'] < row_state['thinking_token_budget_min']
             )
+
             if row_state and under_min_budget:
                 argmax_tok = torch.argmax(logits[i]).item()
                 argmax_is_exit = (
                     argmax_tok == self.think_end_token_ids[0]
-                    or (self.think_start_token_ids and argmax_tok == self.think_start_token_ids[0])
                     or argmax_tok in self.eos_token_ids
                 )
                 if row_state["continuation_mode"] == "wait":
@@ -459,17 +424,11 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     # Suppress exit tokens directly; let the model pick next best.
                     if argmax_is_exit:
                         logits[i, self.think_end_token_ids[0]] = -1e9
-                        if self.think_start_token_ids:
-                            logits[i, self.think_start_token_ids[0]] = -1e9
                         for eos_id in self.eos_token_ids:
                             logits[i, eos_id] = -1e9
                     if self.tool_call_token_ids:
                         logits[i, self.tool_call_token_ids[0]] = -1e9
 
-            # After termination sequence has been forced, suppress <think> to prevent
-            # the model from re-entering a thinking block in its answer section.
-            if row_state and row_state.get('terminated') and self.think_start_token_ids:
-                logits[i, self.think_start_token_ids[0]] = -1e9
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
