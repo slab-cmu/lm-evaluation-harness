@@ -99,6 +99,13 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         self.think_start_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<think>"))
         self.think_continuation_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("I need to continue reasoning. I cannot exit the thinking section yet as I haven't reached the required token budget."))
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
+        # For BPE models (e.g. OLMo), the last token of </think> can merge with the following
+        # character (e.g. '>\n' becomes a single token), so scanning output_tok_ids for the
+        # full think_end_token_ids sequence fails. We use a prefix scan instead: for single-token
+        # models (e.g. Qwen, where </think> is a dedicated special token) the prefix equals the
+        # full sequence and behaviour is unchanged.
+        _think_end_full = tokenizer.encode("</think>", add_special_tokens=False)
+        self.think_end_scan_ids = _think_end_full if len(_think_end_full) == 1 else _think_end_full[:-1]
         # Qwen3 sometimes uses <tool_call> as an alternative think-exit boundary (from its
         # tool-use training distribution). Suppress it under min budget alongside </think>.
         self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
@@ -117,6 +124,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         print(
             f"[ThinkingBudget] init: think_end_token_ids={self.think_end_token_ids}, "
+            f"think_end_scan_ids={self.think_end_scan_ids}, "
             f"tool_call_token_ids={self.tool_call_token_ids}, "
             f"eos_token_ids={self.eos_token_ids}",
             flush=True, file=sys.stderr
@@ -186,7 +194,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 prompt_tok_ids, self.think_start_token_ids
             )
             last_end = self._find_last_sequence_index(
-                prompt_tok_ids, self.think_end_token_ids
+                prompt_tok_ids, self.think_end_scan_ids
             )
             in_think = last_start > last_end
         # think_count always starts at 0: we count generated tokens only, not prompt tokens.
@@ -234,12 +242,15 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         # Only scan for </think> in generated tokens. <think> in generated output is
         # ignored: the model should not re-open a thinking block, and scanning for it
         # caused think_count resets when the model referenced <think> in prose.
-        end_len = len(self.think_end_token_ids)
+        # Use think_end_scan_ids (prefix) rather than think_end_token_ids (full) because
+        # BPE models (e.g. OLMo) merge the trailing '>' with the following character into
+        # a single token, so the full sequence is never present in output_tok_ids.
+        end_len = len(self.think_end_scan_ids)
         check_start_idx = max(0, prev_length - end_len + 1)
         recent_tokens = output[check_start_idx:]
 
         recent_end_pos = self._find_last_sequence_index(
-            recent_tokens, self.think_end_token_ids
+            recent_tokens, self.think_end_scan_ids
         )
 
         # Update state based on recent sequences
@@ -510,6 +521,11 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         # Pre-tokenize all think-exit boundary tokens for thinking detection.
         # Qwen3 (without real tool use) may emit any of these as an alternative to </think>.
         self.think_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</think>"))
+        # For BPE models (e.g. OLMo), the last token of </think> merges with the following
+        # character, so we scan for a prefix instead. Single-token models (e.g. Qwen) are
+        # unaffected because the prefix equals the full sequence.
+        _think_end_full = tokenizer.encode("</think>", add_special_tokens=False)
+        self.think_end_scan_ids = _think_end_full if len(_think_end_full) == 1 else _think_end_full[:-1]
         self.tool_call_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_call>"))
         self.tool_call_end_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("</tool_call>"))
         self.tool_response_token_ids = tokenizer.convert_tokens_to_ids(tokenizer.tokenize("<tool_response>"))
@@ -592,7 +608,7 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         # Scan from (prev - max_boundary_len) to catch sequences that span scan windows,
         # but always include all newly committed tokens since last scan (from prev onward).
         all_boundary_seqs = [
-            self.think_end_token_ids, self.tool_call_token_ids, self.tool_call_end_token_ids,
+            self.think_end_scan_ids, self.tool_call_token_ids, self.tool_call_end_token_ids,
             self.tool_response_token_ids, self.tool_response_end_token_ids,
         ]
         max_boundary_len = max(len(s) for s in all_boundary_seqs if s)
@@ -604,8 +620,11 @@ class ConstrainedChoiceLogitsProcessor(LogitsProcessor):
         # Qwen3 (without real tool use) may emit any of these as signals that thinking is done.
         # Whichever appears first triggers activation; subsequent scans are skipped
         # because update_state() only calls this when constrained_active is False.
+        # Note: we use think_end_scan_ids (prefix) for </think> so that BPE models like OLMo
+        # are handled correctly — their trailing '>' merges with the next character and the
+        # full think_end_token_ids sequence never appears in output_tok_ids.
         boundary_seqs = [
-            (self.think_end_token_ids, "</think>"),
+            (self.think_end_scan_ids, "</think>"),
             (self.tool_call_token_ids, "<tool_call>"),
             (self.tool_call_end_token_ids, "</tool_call>"),
             (self.tool_response_token_ids, "<tool_response>"),
