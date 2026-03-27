@@ -17,6 +17,9 @@ class Instance:
         default_factory=lambda: (None, None, None)
     )
     resps: list = field(default_factory=list)
+    raw_resps: list = field(default_factory=list)
+    n_thinking_tokens: list = field(default_factory=list)
+    n_output_tokens: list = field(default_factory=list)
     filtered_resps: dict = field(default_factory=dict)
 
     # initialized after init

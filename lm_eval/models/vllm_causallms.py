@@ -1374,6 +1374,9 @@ class VLLM(TemplateLM):
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
         res = []
+        raw_res = []
+        n_thinking_tokens_res = []
+        n_output_tokens_res = []
 
         # batch tokenize contexts
         context, all_gen_kwargs = zip(*(req.args for req in requests))
@@ -1462,6 +1465,26 @@ class VLLM(TemplateLM):
             # cache generations
             for output, context in zip(cont, context):
                 generated_text: str = output.outputs[0].text
+                raw_res.append(generated_text)
+
+                # count tokens in the thinking portion (before think_end_token)
+                # and in the output portion (after think_end_token)
+                n_thinking_toks = None
+                n_output_toks = None
+                if self.think_end_token:
+                    think_tokens = [self.think_end_token] if isinstance(self.think_end_token, str) else self.think_end_token
+                    best_idx = -1
+                    best_token_len = 0
+                    for tok in think_tokens:
+                        idx = generated_text.rfind(tok)
+                        if idx != -1 and (idx > best_idx or (idx == best_idx and len(tok) > best_token_len)):
+                            best_idx = idx
+                            best_token_len = len(tok)
+                    if best_idx != -1:
+                        n_thinking_toks = len(self.tok_encode(generated_text[:best_idx]))
+                        n_output_toks = len(self.tok_encode(generated_text[best_idx + best_token_len:]))
+                n_thinking_tokens_res.append(n_thinking_toks)
+                n_output_tokens_res.append(n_output_toks)
                 # use secondary stop seqs to cut off should-have-been-stopped content post-hoc
 
                 # set think_end_token=self.think_end_token to cut out reasoning traces from samples
@@ -1480,6 +1503,9 @@ class VLLM(TemplateLM):
 
         pbar.close()
         # reorder all group of results back to original unsorted form
+        self.last_raw_resps = re_ords.get_original(raw_res)
+        self.last_n_thinking_tokens = re_ords.get_original(n_thinking_tokens_res)
+        self.last_n_output_tokens = re_ords.get_original(n_output_tokens_res)
         return re_ords.get_original(res)
 
     def _loglikelihood_tokens(

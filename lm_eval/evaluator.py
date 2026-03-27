@@ -598,6 +598,16 @@ def evaluate(
         for x, req in zip(resps, cloned_reqs):
             req.resps.append(x)
 
+        if hasattr(lm, "last_raw_resps") and reqtype == "generate_until":
+            for raw, req in zip(lm.last_raw_resps, cloned_reqs):
+                req.raw_resps.append(raw)
+        if hasattr(lm, "last_n_thinking_tokens") and reqtype == "generate_until":
+            for n_toks, req in zip(lm.last_n_thinking_tokens, cloned_reqs):
+                req.n_thinking_tokens.append(n_toks)
+        if hasattr(lm, "last_n_output_tokens") and reqtype == "generate_until":
+            for n_toks, req in zip(lm.last_n_output_tokens, cloned_reqs):
+                req.n_output_tokens.append(n_toks)
+
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
 
@@ -652,6 +662,9 @@ def evaluate(
                         "target": target,
                         "arguments": [req.args for req in requests],
                         "resps": [req.resps for req in requests],
+                        "raw_resps": [req.raw_resps for req in requests],
+                        "n_thinking_tokens": [req.n_thinking_tokens for req in requests],
+                        "n_output_tokens": [req.n_output_tokens for req in requests],
                         "filtered_resps": [
                             req.filtered_resps[filter_key] for req in requests
                         ],
