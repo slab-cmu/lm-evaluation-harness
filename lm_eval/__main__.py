@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import weave
 import yaml
 from functools import partial
 from pathlib import Path
