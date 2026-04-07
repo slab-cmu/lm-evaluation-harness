@@ -415,6 +415,7 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
             under_min_budget = (
                 row_state is not None
+                and row_state['in_think']
                 and row_state['think_count'] < row_state['thinking_token_budget_min']
             )
 
@@ -926,6 +927,7 @@ class VLLM(TemplateLM):
         kwargs.pop("device", None)
         self.think_end_token = think_end_token
         self.answer_prefix = answer_prefix
+        self.seed = int(seed)
         self.V1 = os.environ.get("VLLM_USE_V1", "1") != "0"
         self._max_length = max_model_len if max_model_len is not None else max_length
         self.tensor_parallel_size = int(tensor_parallel_size)
@@ -1413,6 +1415,7 @@ class VLLM(TemplateLM):
         )
         # for each different set of kwargs, we execute all requests, by batch.
         eos = self.tokenizer.decode(self.eot_token_id)
+        _request_idx = 0
         for chunk in chunks:
             context_and_encoding, all_gen_kwargs, chunk_doc_ids = zip(*chunk)
             context, context_encoding = zip(*context_and_encoding)
@@ -1450,6 +1453,12 @@ class VLLM(TemplateLM):
                 if "extra_args" not in kwargs or kwargs["extra_args"] is None:
                     kwargs["extra_args"] = {}
                 kwargs["extra_args"]["doc_id"] = doc_id
+
+                # Use a unique per-request seed so repeated identical prompts
+                # (from repeats > 1) produce diverse samples instead of identical outputs.
+                if "seed" not in kwargs:
+                    kwargs["seed"] = self.seed + _request_idx
+                _request_idx += 1
 
                 sampling_params.append(
                     SamplingParams(max_tokens=max_gen_toks, stop=until, **kwargs)
@@ -1495,6 +1504,15 @@ class VLLM(TemplateLM):
                 generated_text = postprocess_generated_text(
                     generated_text, until, think_end_token=self.think_end_token  # None
                 )
+                if self.answer_prefix:
+                    stripped_prefix = self.answer_prefix.strip()
+                    if generated_text.lstrip().startswith(stripped_prefix):
+                        generated_text = generated_text.lstrip()[len(stripped_prefix):]
+                        # If the prefix ends with an open brace, strip the matching close
+                        if stripped_prefix.endswith("{"):
+                            close = generated_text.find("}")
+                            if close != -1:
+                                generated_text = generated_text[:close]
                 res.append(generated_text)
                 self.cache_hook.add_partial(
                     "generate_until", (context, gen_kwargs), generated_text
