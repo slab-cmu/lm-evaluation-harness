@@ -1073,8 +1073,9 @@ class ConfigurableTask(Task):
                     path=self.config.fewshot_config.get('dataset_path', ""),
                     name=self.config.fewshot_config.get('dataset_name', "")
                 )
-                if self.config.fewshot_config.get("process_docs", None) is not None:
-                    return self.config.fewshot_config.process_docs(
+                process_docs = self.config.fewshot_config.get("process_docs", None)
+                if process_docs is not None:
+                    return process_docs(
                         self.fewshot_dataset[self.config.fewshot_split]
                     )
                 return self.fewshot_dataset[self.config.fewshot_split]

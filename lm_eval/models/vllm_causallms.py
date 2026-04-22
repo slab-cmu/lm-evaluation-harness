@@ -359,13 +359,18 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
             for i1, i2, direction in batch_update.moved:
                 if direction == MoveDirectionality.SWAP:
-                    state1 = self._state.get(i1, {})
-                    state2 = self._state.get(i2, {})
-                    if state1 or state2:
-                        self._state[i1] = state2
+                    state1 = self._state.pop(i1, None)
+                    state2 = self._state.pop(i2, None)
+                    if state1 is not None:
                         self._state[i2] = state1
+                    if state2 is not None:
+                        self._state[i1] = state2
                 else:
-                    self._state[i2] = self._state.pop(i1, {})
+                    state = self._state.pop(i1, None)
+                    if state is not None:
+                        self._state[i2] = state
+                    else:
+                        self._state.pop(i2, None)
 
         for state in self._state.values():
             self._update_think_state(state)
@@ -415,8 +420,8 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
             under_min_budget = (
                 row_state is not None
-                and row_state['in_think']
-                and row_state['think_count'] < row_state['thinking_token_budget_min']
+                and row_state.get('in_think', False)
+                and row_state.get('think_count', 0) < row_state.get('thinking_token_budget_min', 0)
             )
 
             if row_state and under_min_budget:
@@ -1506,6 +1511,8 @@ class VLLM(TemplateLM):
                 )
                 if self.answer_prefix:
                     stripped_prefix = self.answer_prefix.strip()
+                    if '\\boxed{' in self.answer_prefix: 
+                        stripped_prefix = "\\boxed{"
                     if generated_text.lstrip().startswith(stripped_prefix):
                         generated_text = generated_text.lstrip()[len(stripped_prefix):]
                         # If the prefix ends with an open brace, strip the matching close
