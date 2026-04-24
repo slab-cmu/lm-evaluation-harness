@@ -1,3 +1,4 @@
+import atexit
 import copy
 import gc
 import logging
@@ -1016,6 +1017,26 @@ class VLLM(TemplateLM):
 
             print("vLLM model initialized successfully", flush=True, file=sys.stderr)
             print(f"Logits processors registered: {len(processors)}", flush=True, file=sys.stderr)
+
+            # Register an atexit handler that explicitly tears down vllm and the
+            # torch.distributed process group before Python's GC runs. Without
+            # this, cleanup happens non-deterministically during interpreter
+            # shutdown, which can leave nsys waiting on a process that never
+            # signals a clean exit.
+            model_ref = self.model
+            def _vllm_atexit_cleanup():
+                try:
+                    engine_core = model_ref.llm_engine.engine_core
+                    engine_core.shutdown()
+                except Exception:
+                    pass
+                try:
+                    import torch.distributed as dist
+                    if dist.is_available() and dist.is_initialized():
+                        dist.destroy_process_group()
+                except Exception:
+                    pass
+            atexit.register(_vllm_atexit_cleanup)
         else:
             eval_logger.warning(
                 "You might experience occasional issues with model weight downloading when data_parallel is in use. To ensure stable performance, run with data_parallel_size=1 until the weights are downloaded and cached."
