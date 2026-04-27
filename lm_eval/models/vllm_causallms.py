@@ -1401,6 +1401,7 @@ class VLLM(TemplateLM):
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
     ) -> List[str]:
+        torch.cuda.nvtx.range_push("lmeval::generate_until")
         res = []
         raw_res = []
         n_thinking_tokens_res = []
@@ -1491,11 +1492,13 @@ class VLLM(TemplateLM):
                 )
 
             # perform batched generation
+            torch.cuda.nvtx.range_push(f"lmeval::model_generate(n={len(context_encoding_truncated)})")
             cont = self._model_generate(
                 requests=context_encoding_truncated,
                 generate=True,
                 sampling_params=sampling_params
             )
+            torch.cuda.nvtx.range_pop()  # lmeval::model_generate
 
             # cache generations
             for output, context in zip(cont, context):
@@ -1552,6 +1555,7 @@ class VLLM(TemplateLM):
         self.last_raw_resps = re_ords.get_original(raw_res)
         self.last_n_thinking_tokens = re_ords.get_original(n_thinking_tokens_res)
         self.last_n_output_tokens = re_ords.get_original(n_output_tokens_res)
+        torch.cuda.nvtx.range_pop()  # lmeval::generate_until
         return re_ords.get_original(res)
 
     def _loglikelihood_tokens(
