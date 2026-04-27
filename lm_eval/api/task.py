@@ -1361,7 +1361,9 @@ class ConfigurableTask(Task):
         else:
             doc_to_target = self.config.doc_to_target
 
-        if isinstance(doc_to_target, int):
+        if doc_to_target is None:
+            return ""
+        elif isinstance(doc_to_target, int):
             return doc_to_target
         elif isinstance(doc_to_target, str):
             if doc_to_target in self.features:
