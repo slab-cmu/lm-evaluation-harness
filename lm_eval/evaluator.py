@@ -607,6 +607,9 @@ def evaluate(
         if hasattr(lm, "last_n_output_tokens") and reqtype == "generate_until":
             for n_toks, req in zip(lm.last_n_output_tokens, cloned_reqs):
                 req.n_output_tokens.append(n_toks)
+        if hasattr(lm, "last_vllm_metrics") and reqtype == "generate_until":
+            for metrics_dict, req in zip(lm.last_vllm_metrics, cloned_reqs):
+                req.vllm_metrics.append(metrics_dict)
 
         if lm.world_size > 1:
             lm.accelerator.wait_for_everyone()
@@ -665,6 +668,7 @@ def evaluate(
                         "raw_resps": [req.raw_resps for req in requests],
                         "n_thinking_tokens": [req.n_thinking_tokens for req in requests],
                         "n_output_tokens": [req.n_output_tokens for req in requests],
+                        "vllm_metrics": [req.vllm_metrics for req in requests],
                         "filtered_resps": [
                             req.filtered_resps[filter_key] for req in requests
                         ],

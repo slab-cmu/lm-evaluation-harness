@@ -20,6 +20,7 @@ class Instance:
     raw_resps: list = field(default_factory=list)
     n_thinking_tokens: list = field(default_factory=list)
     n_output_tokens: list = field(default_factory=list)
+    vllm_metrics: list = field(default_factory=list)
     filtered_resps: dict = field(default_factory=dict)
 
     # initialized after init

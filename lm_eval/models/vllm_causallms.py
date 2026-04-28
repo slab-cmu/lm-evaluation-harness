@@ -1406,6 +1406,7 @@ class VLLM(TemplateLM):
         raw_res = []
         n_thinking_tokens_res = []
         n_output_tokens_res = []
+        vllm_metrics_res = []
 
         # batch tokenize contexts
         context, all_gen_kwargs = zip(*(req.args for req in requests))
@@ -1500,6 +1501,66 @@ class VLLM(TemplateLM):
             )
             torch.cuda.nvtx.range_pop()  # lmeval::model_generate
 
+            # collect per-request vLLM metrics (v1 RequestStateStats API)
+            # Always append one entry per output so indices align with cont/vllm_metrics_res.
+            _batch_metrics: list[dict] = []
+            for output in cont:
+                m = output.metrics  # RequestStateStats in vLLM v1
+                req_metrics: dict = {}
+                if m is not None:
+                    n_prompt = len(output.prompt_token_ids) if output.prompt_token_ids else 0
+                    n_gen = m.num_generation_tokens
+                    n_cached = output.num_cached_tokens if output.num_cached_tokens is not None else 0
+
+                    prefill_t = decode_t = inf_t = itl = e2e = None
+                    if m.scheduled_ts > 0 and m.first_token_ts > 0 and m.last_token_ts > 0:
+                        prefill_t = m.first_token_ts - m.scheduled_ts
+                        decode_t  = m.last_token_ts  - m.first_token_ts
+                        inf_t     = m.last_token_ts  - m.scheduled_ts
+                        if n_gen > 1 and decode_t > 0:
+                            itl = decode_t / (n_gen - 1)
+                        e2e = m.first_token_latency + decode_t
+                    elif m.first_token_latency > 0:
+                        prefill_t = m.first_token_latency
+                        e2e = m.first_token_latency
+
+                    req_metrics = {
+                        "vllm:request_prompt_tokens":              n_prompt,
+                        "vllm:request_generation_tokens":          n_gen,
+                        "vllm:request_prefill_kv_computed_tokens": n_cached,
+                        "vllm:request_prefill_time_seconds":       prefill_t,
+                        "vllm:request_inference_time_seconds":     inf_t,
+                        "vllm:request_decode_time_seconds":        decode_t,
+                        "vllm:inter_token_latency_seconds":        itl,
+                        "vllm:e2e_request_latency_seconds":        e2e,
+                    }
+                _batch_metrics.append(req_metrics)
+
+            # log batch-mean summary
+            filled = [m for m in _batch_metrics if m]
+            if filled:
+                def _avg(k):
+                    v = [x[k] for x in filled if x.get(k) is not None]
+                    return sum(v) / len(v) if v else float("nan")
+                eval_logger.info(
+                    "vllm per-request metrics (n=%d) — "
+                    "prompt_tokens: %.0f | gen_tokens: %.0f | cached_tokens: %.0f | "
+                    "prefill: %.3fs | inference: %.3fs | decode: %.3fs | "
+                    "ITL: %.4fs | e2e: %.3fs",
+                    len(filled),
+                    _avg("vllm:request_prompt_tokens"),
+                    _avg("vllm:request_generation_tokens"),
+                    _avg("vllm:request_prefill_kv_computed_tokens"),
+                    _avg("vllm:request_prefill_time_seconds"),
+                    _avg("vllm:request_inference_time_seconds"),
+                    _avg("vllm:request_decode_time_seconds"),
+                    _avg("vllm:inter_token_latency_seconds"),
+                    _avg("vllm:e2e_request_latency_seconds"),
+                )
+
+            # accumulate for samples JSON (aligned with res/n_thinking_tokens_res)
+            vllm_metrics_res.extend(_batch_metrics)
+
             # cache generations
             for output, context in zip(cont, context):
                 generated_text: str = output.outputs[0].text
@@ -1555,6 +1616,7 @@ class VLLM(TemplateLM):
         self.last_raw_resps = re_ords.get_original(raw_res)
         self.last_n_thinking_tokens = re_ords.get_original(n_thinking_tokens_res)
         self.last_n_output_tokens = re_ords.get_original(n_output_tokens_res)
+        self.last_vllm_metrics = re_ords.get_original(vllm_metrics_res)
         torch.cuda.nvtx.range_pop()  # lmeval::generate_until
         return re_ords.get_original(res)
 
