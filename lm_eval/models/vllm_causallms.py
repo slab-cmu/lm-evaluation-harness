@@ -73,6 +73,16 @@ eval_logger = logging.getLogger(__name__)
 # At 64, worst-case overshoot is 64 tokens: 64 + 25 = 89 << 256 headroom.
 THINKING_BUDGET_COUNTDOWN_CAP = 64
 
+# Debug logging for the thinking-budget / force_n logits processor.
+# Set FORCE_N_DEBUG=1 to enable verbose per-step state traces (large volume,
+# only useful for smoke tests with --limit 4). Always-on logs (init banner,
+# per-request setup, first <think> detection, first force_n intercept) fire
+# regardless.
+FORCE_N_DEBUG = os.environ.get("FORCE_N_DEBUG", "0") == "1"
+# Cap verbose log volume to the first N docs and first M steps each.
+FORCE_N_DEBUG_MAX_DOCS = int(os.environ.get("FORCE_N_DEBUG_MAX_DOCS", "4"))
+FORCE_N_DEBUG_MAX_STEPS = int(os.environ.get("FORCE_N_DEBUG_MAX_STEPS", "80"))
+
 # Candidate Continuation Behavior:
 #   1. Sample Next Most Likely Token
 #   2. Sample: "Wait" Token
@@ -280,11 +290,31 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         ):
             start_check_idx = max(0, prev_length - start_len + 1)
             recent_start_window = output[start_check_idx:]
-            if self._find_last_sequence_index(
+            found_at = self._find_last_sequence_index(
                 recent_start_window, self.think_start_token_ids
-            ) >= 0:
+            )
+            # Diagnostic: log the first few scan attempts so we can see what
+            # think_start_token_ids actually is and what tokens the model has
+            # generated, regardless of whether we found a match.
+            if FORCE_N_DEBUG and (state.get("doc_id") or 0) < FORCE_N_DEBUG_MAX_DOCS:
+                print(
+                    f"[ForceN-scan] doc_id={state.get('doc_id')} "
+                    f"output_len={current_length} "
+                    f"think_start_ids={self.think_start_token_ids} "
+                    f"first16_out={output[:16]} "
+                    f"found_at={found_at}",
+                    flush=True, file=sys.stderr,
+                )
+            if found_at >= 0:
                 state["in_think"] = True
                 state["entered_think_via_gen"] = True
+                print(
+                    f"[ThinkingBudget] doc_id={state.get('doc_id')} entered_think_via_gen: "
+                    f"output_len={current_length}, "
+                    f"think_start_token_ids={self.think_start_token_ids}, "
+                    f"new_tokens={new_tokens[:8]}",
+                    flush=True, file=sys.stderr,
+                )
 
         # Update state based on recent sequences
         if not state["in_end"]:
@@ -361,6 +391,19 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     )
                     self._state[index]["output_tok_ids"] = output_tok_ids
                     self._state[index]["doc_id"] = doc_id
+                    self._state[index]["_apply_calls"] = 0
+                    self._state[index]["_force_n_intercepts"] = 0
+                    self._state[index]["_force_n_fires"] = 0
+                    # One-time per-request setup log so we can confirm extra_args
+                    # actually arrived at the processor and what mode is active.
+                    init_in_think = self._state[index]["in_think"]
+                    print(
+                        f"[ThinkingBudget] doc_id={doc_id} request_added: "
+                        f"mode={continuation_mode}, max_continuations={max_continuations}, "
+                        f"budget=[{thinking_token_budget_min}, {thinking_token_budget_max}], "
+                        f"init_in_think={init_in_think}, prompt_len={len(prompt_tok_ids) if prompt_tok_ids else 0}",
+                        flush=True, file=sys.stderr,
+                    )
                 else:
                     # Remove state if no thinking budget
                     self._state.pop(index, None)
@@ -385,6 +428,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                         f"total_output_tokens={total_toks}, "
                         f"think_count={state.get('think_count')}, "
                         f"budget=[{state.get('thinking_token_budget_min')}, {state.get('thinking_token_budget_max')}], "
+                        f"mode={state.get('continuation_mode')}, "
+                        f"max_continuations={state.get('max_continuations')}, "
+                        f"n_continuations_emitted={state.get('n_continuations_emitted', 0)}, "
+                        f"force_n_exits_seen={state.get('_force_n_intercepts', 0)}, "
+                        f"force_n_fires={state.get('_force_n_fires', 0)}, "
+                        f"entered_think_via_gen={state.get('entered_think_via_gen', False)}, "
                         f"in_think={state.get('in_think')}, in_end={state.get('in_end')}, "
                         f"tail={repr(tail_text)}",
                         flush=True, file=sys.stderr
@@ -424,6 +473,35 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         for i in range(batch_size):
             row_state = self._state.get(i)
+
+            # Per-step verbose trace (gated). Useful for confirming whether
+            # apply() ever sees in_think=True on smoke runs. To enable, set
+            # the env var FORCE_N_DEBUG=1 in the slurm script.
+            if FORCE_N_DEBUG and row_state is not None:
+                row_state["_apply_calls"] = row_state.get("_apply_calls", 0) + 1
+                _doc = row_state.get("doc_id")
+                # Only verbose-log the first N docs, first M apply() steps each.
+                if (
+                    _doc is not None
+                    and _doc < FORCE_N_DEBUG_MAX_DOCS
+                    and row_state["_apply_calls"] <= FORCE_N_DEBUG_MAX_STEPS
+                ):
+                    try:
+                        argmax_tok = torch.argmax(logits[i]).item()
+                    except Exception:
+                        argmax_tok = -1
+                    print(
+                        f"[ForceN-trace] doc_id={_doc} step={row_state['_apply_calls']}: "
+                        f"in_think={row_state['in_think']} "
+                        f"in_end={row_state['in_end']} "
+                        f"in_cont={row_state.get('in_continuation', False)} "
+                        f"think_count={row_state.get('think_count', 0)} "
+                        f"n_cont_emitted={row_state.get('n_continuations_emitted', 0)} "
+                        f"check_cd={row_state.get('check_count_down', 0)} "
+                        f"out_len={len(row_state.get('output_tok_ids', []))} "
+                        f"argmax={argmax_tok}",
+                        flush=True, file=sys.stderr,
+                    )
             if row_state and row_state["in_end"]:
                 self.mask[i] = True
                 termination_token_ids = row_state["termination_token_ids"]
@@ -491,10 +569,12 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             if (
                 row_state
                 and row_state["continuation_mode"] == "force_n"
-                and row_state.get('in_think', False)
                 and row_state.get("max_continuations") is not None
                 and not row_state.get("in_end", False)
             ):
+                # We may need to log even when in_think is False — that's the
+                # case we're trying to diagnose. Compute everything regardless.
+                in_think = row_state.get('in_think', False)
                 argmax_tok = torch.argmax(logits[i]).item()
                 argmax_is_exit = (
                     argmax_tok == self.think_end_token_ids[0]
@@ -503,7 +583,25 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 cont_remaining = (
                     row_state["max_continuations"] - row_state.get("n_continuations_emitted", 0)
                 )
-                if cont_remaining > 0 and (
+
+                # Always-on log: any time the model would have exited while in
+                # force_n mode, record what we saw (whether we intercepted or not).
+                # This tells us if we ever miss an intercept because in_think=False.
+                if argmax_is_exit and not row_state.get("in_continuation", False):
+                    row_state["_force_n_intercepts"] = row_state.get("_force_n_intercepts", 0) + 1
+                    print(
+                        f"[ThinkingBudget] doc_id={row_state.get('doc_id')}: "
+                        f"force_n exit_seen "
+                        f"in_think={in_think} "
+                        f"argmax={argmax_tok} "
+                        f"will_intercept={in_think and cont_remaining > 0} "
+                        f"n_emitted={row_state.get('n_continuations_emitted', 0)}/"
+                        f"{row_state['max_continuations']} "
+                        f"think_count={row_state['think_count']}",
+                        flush=True, file=sys.stderr,
+                    )
+
+                if in_think and cont_remaining > 0 and (
                     argmax_is_exit
                     or (
                         row_state["in_continuation"]
@@ -511,11 +609,13 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     )
                 ):
                     if not row_state["in_continuation"]:
+                        row_state["_force_n_fires"] = row_state.get("_force_n_fires", 0) + 1
                         print(
                             f"[ThinkingBudget] doc_id={row_state.get('doc_id')}: "
                             f"force_n intercept (#{row_state.get('n_continuations_emitted', 0) + 1}"
                             f"/{row_state['max_continuations']}), "
-                            f"think_count={row_state['think_count']}",
+                            f"think_count={row_state['think_count']}, "
+                            f"continuation_token_0={self.think_continuation_token_ids[0]}",
                             flush=True, file=sys.stderr,
                         )
                     row_state["in_continuation"] = True
