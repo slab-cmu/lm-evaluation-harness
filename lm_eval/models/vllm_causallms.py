@@ -175,7 +175,8 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         return -1
 
     def _init_state_entry(
-        self, prompt_tok_ids: Optional[list[int]], thinking_token_budget_max: int, thinking_token_budget_min: int, answer_prefix_ids:[list[int]], continuation_mode: str
+        self, prompt_tok_ids: Optional[list[int]], thinking_token_budget_max: int, thinking_token_budget_min: int, answer_prefix_ids:[list[int]], continuation_mode: str,
+        max_continuations: Optional[int] = None,
     ) -> dict[str, Any]:
         """Initializes the tracking state for a given sequence index."""
         # Build a per-request copy so different requests don't corrupt the shared list.
@@ -210,6 +211,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             "end_count": 0,  # Number of end tokens forced so far
             "continuation_count": 0,
             "continuation_mode": continuation_mode,
+            # force_n mode: cap the number of times we force the continuation sequence
+            # back into the response. n_continuations_emitted counts completed forces.
+            "max_continuations": max_continuations,
+            "n_continuations_emitted": 0,
             "prompt_tok_ids": prompt_tok_ids,
             "output_tok_ids": [],
             "thinking_token_budget_max": thinking_token_budget_max,
@@ -313,11 +318,18 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 thinking_token_budget_min = params.extra_args.get('thinking_token_budget_min', None)
                 answer_prefix_ids = params.extra_args.get('answer_prefix_ids', None)
                 continuation_mode = params.extra_args.get("continuation_mode", "wait")
+                max_continuations = params.extra_args.get("max_continuations", None)
+                if max_continuations is not None:
+                    try:
+                        max_continuations = int(max_continuations)
+                    except (TypeError, ValueError):
+                        max_continuations = None
                 doc_id = params.extra_args.get("doc_id", None)
 
                 if thinking_token_budget_max is not None or thinking_token_budget_min is not None:
                     self._state[index] = self._init_state_entry(
-                        prompt_tok_ids, thinking_token_budget_max, thinking_token_budget_min, answer_prefix_ids, continuation_mode
+                        prompt_tok_ids, thinking_token_budget_max, thinking_token_budget_min, answer_prefix_ids, continuation_mode,
+                        max_continuations=max_continuations,
                     )
                     self._state[index]["output_tok_ids"] = output_tok_ids
                     self._state[index]["doc_id"] = doc_id
@@ -446,6 +458,42 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                     if self.tool_call_token_ids:
                         logits[i, self.tool_call_token_ids[0]] = -1e9
 
+            # force_n mode: intercept exit attempts and force the continuation sequence
+            # up to `max_continuations` times, independent of the thinking-budget min.
+            if (
+                row_state
+                and row_state["continuation_mode"] == "force_n"
+                and row_state.get('in_think', False)
+                and row_state.get("max_continuations") is not None
+                and not row_state.get("in_end", False)
+            ):
+                argmax_tok = torch.argmax(logits[i]).item()
+                argmax_is_exit = (
+                    argmax_tok == self.think_end_token_ids[0]
+                    or argmax_tok in self.eos_token_ids
+                )
+                cont_remaining = (
+                    row_state["max_continuations"] - row_state.get("n_continuations_emitted", 0)
+                )
+                if cont_remaining > 0 and (
+                    argmax_is_exit
+                    or (
+                        row_state["in_continuation"]
+                        and row_state['continuation_count'] < len(self.think_continuation_token_ids)
+                    )
+                ):
+                    if not row_state["in_continuation"]:
+                        print(
+                            f"[ThinkingBudget] doc_id={row_state.get('doc_id')}: "
+                            f"force_n intercept (#{row_state.get('n_continuations_emitted', 0) + 1}"
+                            f"/{row_state['max_continuations']}), "
+                            f"think_count={row_state['think_count']}",
+                            flush=True, file=sys.stderr,
+                        )
+                    row_state["in_continuation"] = True
+                    self.mask[i] = True
+                    self.force_token_ids[i] = self.think_continuation_token_ids[row_state['continuation_count']]
+
 
         # Check in CPU first not to sync with GPU
         has_active_thinking = any(
@@ -462,10 +510,14 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                 force_tokens = self.force_token_ids[active_indices]
                 logits[active_indices, force_tokens] = 1e9
 
-        # Advance or reset the continuation counter for "wait" mode
+        # Advance or reset the continuation counter for "wait" and "force_n" modes.
+        # "wait" gates on min_budget; "force_n" gates on a per-request counter.
         for i in range(batch_size):
             row_state = self._state.get(i)
-            if row_state is None or row_state["continuation_mode"] != "wait":
+            if row_state is None:
+                continue
+            mode = row_state["continuation_mode"]
+            if mode not in ("wait", "force_n"):
                 continue
             if row_state['in_continuation'] and row_state['continuation_count'] < len(self.think_continuation_token_ids):
                 row_state['continuation_count'] += 1
@@ -479,6 +531,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                         "check_count_down": min(max(1, remaining - term_len), THINKING_BUDGET_COUNTDOWN_CAP),
                     }
                 )
+                # force_n: a full continuation sequence has been emitted; advance the
+                # counter so the next exit attempt may or may not be intercepted.
+                if mode == "force_n":
+                    row_state["n_continuations_emitted"] = row_state.get("n_continuations_emitted", 0) + 1
 
         return logits
 
