@@ -215,6 +215,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             # back into the response. n_continuations_emitted counts completed forces.
             "max_continuations": max_continuations,
             "n_continuations_emitted": 0,
+            # One-shot flag: True after _update_think_state has detected a
+            # generated <think> opener and flipped in_think=True. Prevents
+            # later prose references to <think> from re-entering think mode.
+            "entered_think_via_gen": False,
             "prompt_tok_ids": prompt_tok_ids,
             "output_tok_ids": [],
             "thinking_token_budget_max": thinking_token_budget_max,
@@ -257,6 +261,30 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
         recent_end_pos = self._find_last_sequence_index(
             recent_tokens, self.think_end_scan_ids
         )
+
+        # Detect a generated <think> opener. The prompt-state heuristic in
+        # _init_state_entry can return in_think=False when the prompt contains
+        # *closed* <think>...</think> blocks (e.g. few-shot demonstrations),
+        # because the heuristic only checks whether the LAST <think> is unclosed.
+        # In those cases the model emits its own <think> as the first generated
+        # token, and we must flip in_think=True here or no budget/force_n logic
+        # ever fires. To avoid spurious flips from prose references later in the
+        # generation, we only flip once per request: gated by `terminated=False`
+        # (no </think> has fired yet) and on the first <think> we see.
+        start_len = len(self.think_start_token_ids)
+        if (
+            not state["in_think"]
+            and not state.get("terminated", False)
+            and not state.get("entered_think_via_gen", False)
+            and start_len > 0
+        ):
+            start_check_idx = max(0, prev_length - start_len + 1)
+            recent_start_window = output[start_check_idx:]
+            if self._find_last_sequence_index(
+                recent_start_window, self.think_start_token_ids
+            ) >= 0:
+                state["in_think"] = True
+                state["entered_think_via_gen"] = True
 
         # Update state based on recent sequences
         if not state["in_end"]:
