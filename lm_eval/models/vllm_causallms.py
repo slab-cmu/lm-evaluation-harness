@@ -288,8 +288,15 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
             and not state.get("entered_think_via_gen", False)
             and start_len > 0
         ):
-            start_check_idx = max(0, prev_length - start_len + 1)
-            recent_start_window = output[start_check_idx:]
+            # Scan from the start of the output. <think> is the first token the
+            # model generates in thinking mode, so we want a fixed-size window at
+            # the beginning of the buffer, not an incrementally-advancing one.
+            # In vllm V1, output_tok_ids is pre-allocated with -1 placeholders
+            # and tokens get written in-place as they're sampled, so an
+            # incremental window can race past position 0 before the placeholder
+            # gets replaced. Looking at output[0:start_len + len(new_tokens)]
+            # always covers position 0 of the real generation.
+            recent_start_window = output[: start_len + len(new_tokens)]
             found_at = self._find_last_sequence_index(
                 recent_start_window, self.think_start_token_ids
             )
