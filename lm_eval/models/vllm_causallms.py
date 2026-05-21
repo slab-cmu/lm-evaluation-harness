@@ -608,11 +608,32 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                         flush=True, file=sys.stderr,
                     )
 
+                # Reset stale continuation state BEFORE checking whether to fire.
+                # The end-of-apply() advance block increments continuation_count up
+                # to len(seq) after the last token of a continuation sequence has
+                # been forced. If a new exit attempt fires in the same step the
+                # advance block runs (or before the next apply()'s advance fires),
+                # we'd index past the end of think_continuation_token_ids. Reset
+                # now so the next intercept starts cleanly at count=0.
+                cont_seq_len = len(self.think_continuation_token_ids)
+                if (
+                    row_state.get("in_continuation", False)
+                    and row_state['continuation_count'] >= cont_seq_len
+                ):
+                    row_state["in_continuation"] = False
+                    row_state['continuation_count'] = 0
+                    row_state["n_continuations_emitted"] = row_state.get("n_continuations_emitted", 0) + 1
+                    # Recompute cont_remaining after the increment so the gate
+                    # below sees the up-to-date count.
+                    cont_remaining = (
+                        row_state["max_continuations"] - row_state["n_continuations_emitted"]
+                    )
+
                 if in_think and cont_remaining > 0 and (
                     argmax_is_exit
                     or (
                         row_state["in_continuation"]
-                        and row_state['continuation_count'] < len(self.think_continuation_token_ids)
+                        and row_state['continuation_count'] < cont_seq_len
                     )
                 ):
                     if not row_state["in_continuation"]:
@@ -627,7 +648,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                         )
                     row_state["in_continuation"] = True
                     self.mask[i] = True
-                    self.force_token_ids[i] = self.think_continuation_token_ids[row_state['continuation_count']]
+                    # Defensive clamp in case the advance block raced us — we'd
+                    # rather emit the first token of the sequence than crash.
+                    cc = min(row_state['continuation_count'], cont_seq_len - 1)
+                    self.force_token_ids[i] = self.think_continuation_token_ids[cc]
 
 
         # Check in CPU first not to sync with GPU
@@ -647,6 +671,10 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
 
         # Advance or reset the continuation counter for "wait" and "force_n" modes.
         # "wait" gates on min_budget; "force_n" gates on a per-request counter.
+        # Note: for force_n, n_continuations_emitted is incremented at the TOP of
+        # the per-row force_n branch when we detect a stale full-length count,
+        # not here. This block just advances continuation_count and (for "wait")
+        # resets it when the sequence finishes.
         for i in range(batch_size):
             row_state = self._state.get(i)
             if row_state is None:
@@ -666,10 +694,6 @@ class ThinkingTokenBudgetLogitsProcessor(LogitsProcessor):
                         "check_count_down": min(max(1, remaining - term_len), THINKING_BUDGET_COUNTDOWN_CAP),
                     }
                 )
-                # force_n: a full continuation sequence has been emitted; advance the
-                # counter so the next exit attempt may or may not be intercepted.
-                if mode == "force_n":
-                    row_state["n_continuations_emitted"] = row_state.get("n_continuations_emitted", 0) + 1
 
         return logits
 
